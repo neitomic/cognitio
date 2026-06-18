@@ -1,0 +1,22 @@
+[project]
+name = "cognitio-api"
+version = "0.1.0"
+description = "Cognitio Layer 7 — FastAPI HTTP surface."
+requires-python = ">=3.12"
+dependencies = [
+    "cognitio-storage",
+    "cognitio-connectors",
+    "cognitio-pipeline",
+    "cognitio-review",
+    "cognitio-query",
+    "fastapi>=0.115",
+    "pydantic>=2.7",
+    "uvicorn[standard]>=0.30",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/cognitio_api"]

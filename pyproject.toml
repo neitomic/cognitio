@@ -1,0 +1,63 @@
+[project]
+name = "cognitio"
+version = "0.1.0"
+description = "A living knowledge platform — source-backed extraction and review with semantic search."
+readme = "README.md"
+requires-python = ">=3.12"
+# The root project is a meta-package; real code lives in the workspace members
+# under packages/ and apps/. It depends on every member so `uv sync` at the
+# root provisions the whole monorepo.
+dependencies = [
+    "cognitio-storage",
+    "cognitio-connectors",
+    "cognitio-pipeline",
+    "cognitio-extraction",
+    "cognitio-review",
+    "cognitio-query",
+    "cognitio-api",
+    "cognitio-worker",
+]
+
+[tool.uv.workspace]
+members = [
+    "packages/storage",
+    "packages/connectors",
+    "packages/pipeline",
+    "packages/extraction",
+    "packages/review",
+    "packages/query",
+    "packages/api",
+    "apps/worker",
+]
+
+[tool.uv.sources]
+cognitio-storage = { workspace = true }
+cognitio-connectors = { workspace = true }
+cognitio-pipeline = { workspace = true }
+cognitio-extraction = { workspace = true }
+cognitio-review = { workspace = true }
+cognitio-query = { workspace = true }
+cognitio-api = { workspace = true }
+cognitio-worker = { workspace = true }
+
+[dependency-groups]
+dev = [
+    "pytest>=8.0",
+    "pytest-asyncio>=0.23",
+    "ruff>=0.5",
+    "mypy>=1.10",
+]
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+asyncio_mode = "auto"
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
