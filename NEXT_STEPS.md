@@ -409,6 +409,13 @@ Work:
 - Resolve principal/source identities before candidate lookup. Change
   `SemanticSearchRepository.candidates()` to accept `ResolvedAcl`, and apply tenant, lifecycle,
   `is_current`, model version, similarity floor, and effective-ACL predicates in SQL before `LIMIT`.
+- Make search **hybrid lexical + vector**, not pure-pgvector. Add a `tsvector`/GIN full-text index
+  over the searchable content of `normalized_documents` and `extractions` (decision title/text,
+  fact claim, action description) — add the FTS columns/indexes to the migration. Run an ANN leg and
+  an FTS leg, both with the **same ACL/tenant/lifecycle/`is_current` predicates applied in SQL before
+  `LIMIT`**, then fuse the two result sets with **Reciprocal Rank Fusion (RRF)** (or weighted-score
+  fusion) into the final ranking. Exact-term queries (names, IDs, error strings) must be reachable
+  via the lexical leg.
 - Join extraction → source version → source item to build `SearchCandidate`/`SourceSummary`; return
   evidence/provenance via the source drilldown, not hidden ad-hoc SQL in the API.
 - Keep disputed/stale weighting already present in `SearchService`, but exclude archived and
@@ -568,3 +575,24 @@ Do not put these on the prototype critical path:
 
 They remain compatible with the proposed schema, but none is required to prove one trustworthy
 incremental source-backed extraction can be found and reviewed.
+
+## Phase 2 / Phase 3 follow-on notes
+
+These are not on the prototype critical path, but they extend deferred work and should be scheduled
+with the phase that lights up each subsystem.
+
+- **Phase 2 — blocking index for entity resolution and contradiction candidates.** When the entity
+  resolution pass and the contradiction detector are built, include building the **two-stage blocking
+  index** so neither does an O(n²) all-pairs scan: a `pg_trgm` GIN index on normalized entity
+  names/aliases (and on normalized claim text) for the lexical block, plus pgvector ANN over
+  entity/fact embeddings filtered by shared subject entity for the semantic block. Only the union of
+  both blocks reaches the expensive resolution model / contradiction classifier.
+- **Phase 2 — calibrate edge thresholds.** The materialization thresholds and fan-out caps for
+  `supports`/`contradicts` (`supports` ≥ 0.7, ≤ 50/Gold fact; `contradicts` ≥ 0.8, ≤ 20) are
+  starting points. Calibrate them against the **contradiction-detector eval set** before relying on
+  the materialized edges, balancing false positives (queue flood) against false negatives (silent
+  Gold corruption).
+- **Phase 3 — head-to-head GAG vs. flat-RAG eval.** As a Phase 3 milestone alongside GAG, add an A/B
+  eval: graph-augmented generation vs. flat semantic RAG on the **same question set**, graded by a
+  **blind LLM-as-judge**, tracking answer-quality, token-usage, and tool-call-count deltas. This is
+  the test that proves the graph earns its added complexity.
