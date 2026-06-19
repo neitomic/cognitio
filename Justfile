@@ -54,5 +54,15 @@ test:
 test-int:
     uv run pytest -m "integration"
 
-# Everything CI runs, in order.
-ci: lint type test
+# Integration tests, but only when TEST_DATABASE_URL is set (no-op otherwise).
+# Lets `just ci` reproduce CI locally without forcing a Postgres on every run.
+ci-int:
+    #!/usr/bin/env sh
+    if [ -n "$TEST_DATABASE_URL" ]; then
+        uv run pytest -m "integration"
+    else
+        echo "TEST_DATABASE_URL not set — skipping integration tests (they run in CI)."
+    fi
+
+# Everything CI runs, in order (integration runs only when TEST_DATABASE_URL is set).
+ci: lint type test ci-int

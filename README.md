@@ -17,16 +17,18 @@ knowledge means something.
 
 ## Architecture at a glance
 
-Seven independently implementable layers, dependencies pointing **downward only**:
+Seven independently implementable layers, dependencies pointing **downward only** (an orchestrator
+ranks above what it orchestrates — Pipeline runs Extraction/Query/Review as job stages, so it sits
+above them; this matches `LAYER_RANK` in `tests/test_boundaries.py`):
 
 ```
-7. API Layer            FastAPI — sync, review, search, cost   packages/api
-6. Query Layer          semantic search · GAG · ACL @ query     packages/query
-5. Review Layer         review lifecycle · promotion · audit    packages/review
-4. Extraction Layer     Claude · extraction.v1 · evidence       packages/extraction
-3. Pipeline Layer       job queue (SKIP LOCKED) · workers       packages/pipeline
-2. Connector Layer      capability-aware sync · Notion          packages/connectors
-1. Storage Layer        Postgres + pgvector · typed tables      packages/storage
+7. API Layer            FastAPI — sync, review, search, cost    packages/api
+6. Pipeline Layer       job queue (SKIP LOCKED) · workers        packages/pipeline
+5. Review Layer         review lifecycle · promotion · audit     packages/review
+4. Query Layer          semantic search · GAG · ACL @ query      packages/query
+3. Extraction Layer     Claude · extraction.v1 · evidence        packages/extraction
+2. Connector Layer      capability-aware sync · Notion           packages/connectors
+1. Storage Layer        Postgres + pgvector · typed tables       packages/storage
 ```
 
 Two cross-cutting invariants are threaded through the layers, never bolted on: **ACL propagation**
@@ -117,8 +119,13 @@ just fmt       # ruff format
 just type      # mypy (strict, shipped source)
 just test      # unit tests (no Docker, no credentials)
 just test-int  # integration tests (require Postgres via TEST_DATABASE_URL)
-just ci        # lint + type + test — the same gates CI runs
+just ci        # lint + type + unit + integration — the gates CI runs
 ```
+
+`just ci` runs `lint type test ci-int`. The `ci-int` step runs the integration suite **only when
+`TEST_DATABASE_URL` is set** (and no-ops otherwise), so a local `just ci` without Postgres still
+reproduces CI's lint/type/unit gates, while a `just ci` with the dev Postgres up reproduces CI in
+full.
 
 Tests use three markers (`unit`, `integration`, `live`). The default suite is `unit`; integration
 tests skip with an actionable message when `TEST_DATABASE_URL` is unset, and `live` tests

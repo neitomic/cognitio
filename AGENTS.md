@@ -22,18 +22,25 @@ Seven layers, one Python package each. **Dependencies point downward only.** A h
 the public interface of any layer below it; **no layer ever calls upward**, and no layer reaches
 around Storage to run ad-hoc SQL.
 
+The rank is the dependency order, **not** a request-flow order: **an orchestrator ranks above what it
+orchestrates.** Pipeline runs Extraction/Query/Review as job stages, so it sits *above* them — it may
+import them, and they may **not** import Pipeline. This numbering matches `LAYER_RANK` in
+`tests/test_boundaries.py`, which enforces it mechanically.
+
 | # | Layer | Package | Owns |
 |---|-------|---------|------|
-| 7 | API | `packages/api` (`cognitio_api`) | FastAPI routes; resolves the principal; delegates to 5/6. No business logic. |
-| 6 | Query | `packages/query` (`cognitio_query`) | Semantic search, GAG traversal, **ACL enforcement before ranking**. |
+| 7 | API | `packages/api` (`cognitio_api`) | FastAPI routes; resolves the principal; delegates to lower layers. No business logic. |
+| 6 | Pipeline | `packages/pipeline` (`cognitio_pipeline`) | `SKIP LOCKED` job queue, worker loop, job stages, invalidation; orchestrates Extraction/Query/Review. |
 | 5 | Review | `packages/review` (`cognitio_review`) | Review lifecycle, promotion rules, conflict/dispute lifecycle. |
-| 4 | Extraction | `packages/extraction` (`cognitio_extraction`) | Claude wrapper, `extraction.v1` schema, span verifier, fingerprints, cost rows. |
-| 3 | Pipeline | `packages/pipeline` (`cognitio_pipeline`) | `SKIP LOCKED` job queue, worker loop, job stages, invalidation. |
+| 4 | Query | `packages/query` (`cognitio_query`) | Semantic search, GAG traversal, **ACL enforcement before ranking**. |
+| 3 | Extraction | `packages/extraction` (`cognitio_extraction`) | Claude wrapper, `extraction.v1` schema, span verifier, fingerprints, cost rows. |
 | 2 | Connector | `packages/connectors` (`cognitio_connectors`) | Capability-aware sync contract; Notion connector; sync state. |
 | 1 | Storage | `packages/storage` (`cognitio_storage`) | Postgres schema, migrations, typed repositories, `Uow`. |
 
-The runnable process is `apps/worker` (`cognitio_worker`), which wires Pipeline + Connector +
-Extraction together into the worker loop.
+Two packages bracket the seven layers and share the same downward-only rule: `cognitio_config`
+(Layer 0 — settings, importable by anything) and the runnable `apps/worker` (`cognitio_worker`,
+rank 8 — the top process), which wires Pipeline + Connector + Extraction together into the worker
+loop.
 
 Two **cross-cutting invariants** are not layers — they are threaded through several layers and must
 never be bolted on later:

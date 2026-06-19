@@ -24,9 +24,11 @@ from typing import Any
 
 import pytest
 
+_REPO_ROOT = Path(__file__).resolve().parent
+
 # Ensure tests/ is importable for the shared factories regardless of plugin load order
 # (mirrors `pythonpath = ["tests"]` in pyproject.toml).
-_TESTS_DIR = str(Path(__file__).resolve().parent / "tests")
+_TESTS_DIR = str(_REPO_ROOT / "tests")
 if _TESTS_DIR not in sys.path:
     sys.path.insert(0, _TESTS_DIR)
 
@@ -88,6 +90,78 @@ async def db_connection(db_engine: Any) -> AsyncIterator[Any]:
         try:
             yield connection
         finally:
+            await transaction.rollback()
+
+
+# --------------------------------------------------------------------------------------------
+# Phase 1 row-writing harness (tasks 6 / 10–13)
+# --------------------------------------------------------------------------------------------
+# These two fixtures give Phase 1 repository integration tests a *migrated* schema and a
+# session-per-test bound to a rolled-back transaction. They are written to slot in cleanly once
+# the Alembic config (task 10) and the SQLAlchemy models / ``db.py`` (task 6) land.
+#
+# WIRE-IN CHECKLIST (do not forget when those tasks land):
+#   - task 10: create the Alembic env at ``packages/storage/alembic.ini`` (+ ``migrations/``) with
+#     the initial migration. ``db_schema`` will then stop skipping and run ``alembic upgrade head``
+#     against TEST_DATABASE_URL automatically — no change needed here.
+#   - task 6: nothing required for ``db_session`` (it binds a plain ``AsyncSession`` to the test
+#     connection). If a ``Uow`` wrapper is preferred, add a sibling ``uow`` fixture that wraps this
+#     same connection so repository code and the test share one rolled-back transaction.
+
+# Location of the Alembic config, per AGENTS.md ("All migrations live in packages/storage ...").
+_ALEMBIC_DIR = _REPO_ROOT / "packages" / "storage"
+_ALEMBIC_INI = _ALEMBIC_DIR / "alembic.ini"
+
+
+@pytest.fixture(scope="session")
+def db_schema() -> str:
+    """Run ``alembic upgrade head`` against TEST_DATABASE_URL once per session.
+
+    Exercises the *real* migration path (preferred over ``Base.metadata.create_all``) so the schema
+    Phase 1 tests write into is exactly what production gets. Skips gracefully when the test DB is
+    unavailable, or — until task 10 lands — when the Alembic config does not exist yet.
+    """
+    import subprocess
+
+    url = _test_database_url()
+    if not url:
+        pytest.skip(_SKIP_REASON)
+    if not _ALEMBIC_INI.exists():
+        pytest.skip(
+            "Alembic config not found at packages/storage/alembic.ini. Migrations land in task 10; "
+            "db_schema will run `alembic upgrade head` automatically once they exist."
+        )
+
+    result = subprocess.run(
+        ["uv", "run", "alembic", "upgrade", "head"],
+        cwd=_ALEMBIC_DIR,
+        env={**os.environ, "TEST_DATABASE_URL": url, "DATABASE_URL": url},
+        capture_output=True,
+        text=True,
+        check=False,
+    )
+    if result.returncode != 0:
+        pytest.fail(f"alembic upgrade head failed:\n{result.stdout}\n{result.stderr}")
+    return url
+
+
+@pytest.fixture
+async def db_session(db_engine: Any, db_schema: str) -> AsyncIterator[Any]:
+    """An ``AsyncSession`` bound to a connection-level transaction that is always rolled back.
+
+    Same isolation pattern as ``db_connection``: the session and any repository code that uses it
+    share one transaction, and nothing they write survives the test. Depends on ``db_schema`` so the
+    tables exist (both skip together when TEST_DATABASE_URL / migrations are absent).
+    """
+    from sqlalchemy.ext.asyncio import AsyncSession
+
+    async with db_engine.connect() as connection:
+        transaction = await connection.begin()
+        session = AsyncSession(bind=connection, expire_on_commit=False)
+        try:
+            yield session
+        finally:
+            await session.close()
             await transaction.rollback()
 
 
