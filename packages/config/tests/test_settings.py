@@ -20,7 +20,8 @@ def test_database_url_is_required() -> None:
     assert "DATABASE_URL" in str(excinfo.value)
 
 
-def test_minimal_settings_have_documented_defaults() -> None:
+def test_minimal_settings_have_documented_defaults(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.delenv("TEST_DATABASE_URL", raising=False)
     settings = _settings(DATABASE_URL=_VALID_DB)
 
     assert settings.database_url == _VALID_DB
