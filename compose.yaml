@@ -1,0 +1,38 @@
+# Local Postgres for Cognitio.
+#
+# Brings up a single pgvector/pgvector:pg16 server hosting two databases:
+#   - cognitio       persistent development database (named volume `cognitio-pgdata`)
+#   - cognitio_test  disposable test database for the `integration` test suite
+#
+# Both databases get the `vector` and `pgcrypto` extensions created at first init by the
+# scripts in ./docker/initdb (executed in lexical order by the postgres entrypoint).
+#
+# Connection URLs (asyncpg driver):
+#   DATABASE_URL=postgresql+asyncpg://cognitio:cognitio@localhost:5432/cognitio
+#   TEST_DATABASE_URL=postgresql+asyncpg://cognitio:cognitio@localhost:5432/cognitio_test
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: cognitio-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: cognitio
+      POSTGRES_PASSWORD: cognitio
+      POSTGRES_DB: cognitio
+    ports:
+      - "5432:5432"
+    volumes:
+      - cognitio-pgdata:/var/lib/postgresql/data
+      - ./docker/initdb:/docker-entrypoint-initdb.d:ro
+    healthcheck:
+      # Ready only once both databases exist and accept connections.
+      test: ["CMD-SHELL", "pg_isready -U cognitio -d cognitio && pg_isready -U cognitio -d cognitio_test"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+      start_period: 10s
+
+volumes:
+  cognitio-pgdata:
+    name: cognitio-pgdata

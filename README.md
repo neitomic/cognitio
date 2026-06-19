@@ -50,31 +50,54 @@ Claude (Haiku `claude-haiku-4-5-20251001` / Sonnet `claude-sonnet-4-6`) structur
 
 - [uv](https://docs.astral.sh/uv/) (`curl -LsSf https://astral.sh/uv/install.sh | sh`)
 - Docker (for local Postgres) or a Postgres ≥ 16 with `pgvector` + `pgcrypto`
+- [`just`](https://just.systems/) (optional, recommended — wraps the commands below)
 - An Anthropic API key (`ANTHROPIC_API_KEY`) for the extraction layer
 
 ### 2. Install the workspace
 
 ```bash
 uv sync                       # resolves and installs every workspace member
+just sync                     # equivalent
 ```
 
-### 3. Start Postgres
+### 3. Configure the environment
 
 ```bash
-docker run -d --name cognitio-pg \
-  -e POSTGRES_PASSWORD=cognitio -e POSTGRES_DB=cognitio \
-  -p 5432:5432 pgvector/pgvector:pg16
-export DATABASE_URL=postgresql+asyncpg://postgres:cognitio@localhost:5432/cognitio
+cp .env.example .env          # then fill in tokens/keys
 ```
 
-### 4. Run migrations
+Settings are read by `cognitio_config.Settings` (see `packages/config`). The example file
+documents every variable, including `DATABASE_URL` and `TEST_DATABASE_URL`.
+
+### 4. Start Postgres (compose)
+
+`compose.yaml` runs `pgvector/pgvector:pg16` with a persistent dev database (`cognitio`) and a
+disposable test database (`cognitio_test`); both get the `vector` and `pgcrypto` extensions on
+first start.
+
+```bash
+just up           # docker compose up -d   — start (waits until healthy)
+just down         # docker compose down    — stop (keeps the data volume)
+just reset-db     # drop & recreate the dev database, then re-create extensions
+```
+
+Connection URLs (already set in `.env.example`):
+
+```bash
+DATABASE_URL=postgresql+asyncpg://cognitio:cognitio@localhost:5432/cognitio
+TEST_DATABASE_URL=postgresql+asyncpg://cognitio:cognitio@localhost:5432/cognitio_test
+```
+
+### 6. Run migrations
+
+> Alembic configuration and the initial migration land in Phase 1 (`packages/storage`).
 
 ```bash
 cd packages/storage
 uv run alembic upgrade head
 ```
 
-### 5. Run the worker and the API
+### 7. Run the worker and the API
 
 ```bash
 # Pipeline worker (claims jobs with SKIP LOCKED, runs the cascade)
@@ -83,6 +106,24 @@ uv run cognitio-worker
 # API (FastAPI) in another shell
 uv run uvicorn cognitio_api.main:app --reload
 ```
+
+## Development & testing
+
+Common tasks are wrapped in the [`Justfile`](./Justfile) (run `just` to list them):
+
+```bash
+just lint      # ruff check + ruff format --check
+just fmt       # ruff format
+just type      # mypy (strict, shipped source)
+just test      # unit tests (no Docker, no credentials)
+just test-int  # integration tests (require Postgres via TEST_DATABASE_URL)
+just ci        # lint + type + test — the same gates CI runs
+```
+
+Tests use three markers (`unit`, `integration`, `live`). The default suite is `unit`; integration
+tests skip with an actionable message when `TEST_DATABASE_URL` is unset, and `live` tests
+(real provider calls) are opt-in only. CI (`.github/workflows/ci.yml`) runs the frozen install,
+lint, type check, the unit suite, and the pgvector-backed integration suite.
 
 ## Repository layout
 
