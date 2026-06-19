@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Cognitio Layer 7 — FastAPI HTTP surface."
 requires-python = ">=3.12"
 dependencies = [
+    "cognitio-config",
     "cognitio-storage",
     "cognitio-connectors",
     "cognitio-pipeline",

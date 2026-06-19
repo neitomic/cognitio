@@ -4,6 +4,7 @@ version = "0.1.0"
 description = "Cognitio pipeline worker process."
 requires-python = ">=3.12"
 dependencies = [
+    "cognitio-config",
     "cognitio-storage",
     "cognitio-connectors",
     "cognitio-pipeline",

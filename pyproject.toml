@@ -8,6 +8,7 @@ requires-python = ">=3.12"
 # under packages/ and apps/. It depends on every member so `uv sync` at the
 # root provisions the whole monorepo.
 dependencies = [
+    "cognitio-config",
     "cognitio-storage",
     "cognitio-connectors",
     "cognitio-pipeline",
@@ -18,8 +19,14 @@ dependencies = [
     "cognitio-worker",
 ]
 
+# The root is an aggregator, not an installable package: uv installs its
+# dependencies (the workspace members) into the environment without building it.
+[tool.uv]
+package = false
+
 [tool.uv.workspace]
 members = [
+    "packages/config",
     "packages/storage",
     "packages/connectors",
     "packages/pipeline",
@@ -31,6 +38,7 @@ members = [
 ]
 
 [tool.uv.sources]
+cognitio-config = { workspace = true }
 cognitio-storage = { workspace = true }
 cognitio-connectors = { workspace = true }
 cognitio-pipeline = { workspace = true }
@@ -57,7 +65,45 @@ select = ["E", "F", "I", "UP", "B"]
 
 [tool.pytest.ini_options]
 asyncio_mode = "auto"
+testpaths = ["tests", "packages", "apps"]
+pythonpath = ["tests"]
+addopts = "--strict-markers"
+markers = [
+    "unit: fast, isolated tests with no external services (default; run everywhere)",
+    "integration: tests that require a Postgres database via TEST_DATABASE_URL",
+    "live: tests that call real external providers (Anthropic/OpenAI/Notion); opt-in only",
+]
 
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# Source lives under src/ layouts in each workspace member.
+mypy_path = [
+    "packages/config/src",
+    "packages/storage/src",
+    "packages/connectors/src",
+    "packages/pipeline/src",
+    "packages/extraction/src",
+    "packages/review/src",
+    "packages/query/src",
+    "packages/api/src",
+    "apps/worker/src",
+]
+explicit_package_bases = true
+# Type-check shipped source under each member's src/ layout. The test suite is exercised by
+# pytest, not mypy (strict typing of pytest fixtures / dynamic settings kwargs is noise).
+files = [
+    "packages/config/src",
+    "packages/storage/src",
+    "packages/connectors/src",
+    "packages/pipeline/src",
+    "packages/extraction/src",
+    "packages/review/src",
+    "packages/query/src",
+    "packages/api/src",
+    "apps/worker/src",
+]
+
+[[tool.mypy.overrides]]
+module = ["pgvector.*"]
+ignore_missing_imports = true

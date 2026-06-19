@@ -1,0 +1,60 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+# Mirrors `just ci` plus the pgvector-backed integration suite. The `live` marker
+# (real Anthropic/OpenAI/Notion calls) is never selected here.
+jobs:
+  build:
+    runs-on: ubuntu-latest
+
+    services:
+      postgres:
+        image: pgvector/pgvector:pg16
+        env:
+          POSTGRES_USER: cognitio
+          POSTGRES_PASSWORD: cognitio
+          POSTGRES_DB: cognitio_test
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U cognitio -d cognitio_test"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 10
+
+    env:
+      TEST_DATABASE_URL: postgresql+asyncpg://cognitio:cognitio@localhost:5432/cognitio_test
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@v5
+        with:
+          enable-cache: true
+
+      - name: Install the workspace (frozen)
+        run: uv sync --frozen
+
+      - name: Lint (ruff)
+        run: |
+          uv run ruff check .
+          uv run ruff format --check .
+
+      - name: Type-check (mypy)
+        run: uv run mypy
+
+      - name: Unit tests
+        run: uv run pytest -m "unit"
+
+      - name: Enable required Postgres extensions
+        run: |
+          PGPASSWORD=cognitio psql -h localhost -U cognitio -d cognitio_test \
+            -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pgcrypto;"
+
+      - name: Integration tests (pgvector)
+        run: uv run pytest -m "integration"

@@ -4,3 +4,6 @@ __pycache__/
 .mypy_cache/
 .pytest_cache/
 .ruff_cache/
+
+# Local environment configuration (never commit secrets; see .env.example)
+.env
