@@ -56,9 +56,8 @@ jobs:
           PGPASSWORD=cognitio psql -h localhost -U cognitio -d cognitio_test \
             -c "CREATE EXTENSION IF NOT EXISTS vector; CREATE EXTENSION IF NOT EXISTS pgcrypto;"
 
-      # TODO(task-10): uncomment when Alembic migrations land
-      # - name: Run migrations
-      #   run: uv run alembic upgrade head
+      - name: Run migrations
+        run: uv run alembic -c packages/storage/alembic.ini upgrade head
 
       - name: Integration tests (pgvector)
         run: uv run pytest -m "integration"

@@ -9,9 +9,10 @@ above Layer 1.
 | File | Purpose |
 |------|---------|
 | `models.py` | SQLAlchemy 2.0 models — one per table in `ARCHITECTURE.md` → Layer 1 Schema. |
+| `types.py` | Declarative `Base`, shared column types, and tenant-safe composite FK helpers. |
 | `db.py` | Async engine, session factory, and the `Uow` (unit-of-work) transactional primitive. |
-| `repositories.py` | Typed repository functions (CRUD + the handful of domain queries) per table. |
-| `migrations/` | Alembic environment + versioned, **forward-only** migrations. |
+| `repositories/` | Typed, tenant-scoped repository classes (CRUD + domain queries) per table group. |
+| `migrations/` | Alembic environment (`env.py`, async) + versioned, **forward-only** migrations. |
 
 ## Responsibilities
 

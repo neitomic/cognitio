@@ -77,6 +77,9 @@ markers = [
 [tool.mypy]
 python_version = "3.12"
 strict = true
+# Alembic version scripts are operational DDL, not typed library code (and their
+# revision-prefixed filenames are not importable module names).
+exclude = ['packages/storage/src/cognitio_storage/migrations/versions/']
 # Source lives under src/ layouts in each workspace member.
 mypy_path = [
     "packages/config/src",
