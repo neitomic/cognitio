@@ -1,598 +1,384 @@
-# Cognitio — Next Implementation Steps
+# Cognitio — Implementation Task Breakdown
 
 ## Target
 
-Build the smallest trustworthy end-to-end slice:
+Build a trustworthy vertical slice:
 
 > one configured Notion page subtree → immutable source snapshot → normalized text and stable
-> chunks → one validated, evidence-backed extraction → one embedding → ACL-filtered search result
+> chunks → validated evidence-backed extractions → review into Gold → ACL-filtered hybrid search
 > with source provenance
 
-Then add manual review and incremental re-indexing without changing the storage or job contracts.
-This is narrower than all of Phase 1, but it validates the two highest-risk claims early:
-
-1. Notion block trees can be rendered into stable text whose character offsets survive extraction.
-2. A model can reliably return `extraction.v1` records with evidence spans that verify against that
-   text.
-
-Rough effort assumes one experienced engineer working full-time. Estimates include focused tests and
-review, but not production UI, deployment hardening, or Phase 2/3 work.
-
-## What exists now
-
-The repository has useful structural contracts but almost no durable implementation:
-
-- The seven packages, dependency direction, Pydantic extraction schema, span verifier, fingerprint
-  function, review/search service shells, FastAPI routes, job payloads, and worker loop are present.
-- `cognitio_extraction.schema`, `validator`, `fingerprint`, `prompt`, and the basic
-  `ClaudeExtractor` contain real logic that can be unit-tested now.
-- `cognitio_query.SearchService`, `AclResolver`, `ReviewService`, `PromotionPolicy`, retry policy,
-  and API routes contain partial domain behavior.
-- Storage is not bootstrapped. `cognitio_storage.__init__` imports missing `models.py` and `db.py`;
-  there are no repositories, migrations, or Alembic configuration.
-- Every pipeline handler and every Notion connector operation is a stub. The worker composition root
-  is also a stub.
-- There are no tests, fixtures, CI workflow, Docker Compose file, environment template, or runnable
-  application configuration.
-- `uv.lock` is a placeholder that `uv` cannot parse, so even the documented test/install commands
-  currently fail.
-
-## Gaps to resolve before implementation
-
-These are contract gaps, not just unfinished method bodies:
-
-1. **Queue transaction ownership is inconsistent.** `Worker.run_once()` calls a handler with a
-   transaction-like object, then calls `queue.complete()` separately. That cannot guarantee the
-   documented invariant that handler writes, job completion, and follow-on enqueue commit together.
-   Storage must own one `Uow` around all three operations.
-2. **Connector checkpoints need a durable home.** `SyncCursorStore` needs one current row per
-   `(tenant_id, connector, scope)`. Reconstructing current cursor, reconciliation health, and scan
-   membership from `change_events` is ambiguous and expensive. Add an explicit
-   `connector_sync_states` table and retain `change_events` as the idempotent event log.
-3. **Tombstone reconciliation needs previous scan membership.** Notion has no deletion feed. Store
-   which source IDs were observed in a completed scoped scan (for example
-   `connector_scan_items`) so an absent item can be archived only after a successful full scan.
-4. **The searchable embedding object is undefined.** `EmbedPayload` includes `chunk_id`, but the
-   `embeddings` uniqueness key and table design do not. The search API returns extraction IDs, while
-   the documented DAG embeds chunks before extractions exist. For the prototype, embed each
-   extraction's canonical searchable text after extraction and key the row by
-   `(tenant_id, object_type='extraction', object_id, model_version)`. Normalized-chunk embeddings can
-   be added later with a first-class chunk table or a stable chunk object ID.
-5. **Chunks are only JSON inside `normalized_documents`.** This makes changed-chunk lookup, text
-   retrieval, and per-chunk job inputs awkward. Add a typed `normalized_chunks` table rather than
-   repeatedly querying and mutating a JSON array. Keep document-global `start_char`/`end_char` and
-   `chunk_hash`; use deterministic chunk IDs.
-6. **Extraction offset semantics need a spike.** The model sees only `Chunk.text`, but evidence
-   offsets must address the entire normalized document. Define model output as chunk-local offsets,
-   translate them by `chunk.start_char`, then validate and persist document-global spans. Update the
-   prompt and tests so this is explicit.
-7. **Notion does not expose complete object ACLs to an integration.** For the prototype, define an
-   honest fallback ACL (configured tenant-visible principals or integration-visible scope), record
-   `permission_metadata=False`, and label this as unsuitable for production multi-user isolation.
-   Do not claim exact Notion ACL parity until a source/identity strategy exists.
-8. **ACL filtering is currently too late.** `SearchService` asks the repository for ANN candidates
-   before resolving ACLs and filters only the returned shortlist in Python. Resolve the principal
-   first and pass `ResolvedAcl` into the repository so SQL applies ACL predicates before the ANN
-   limit/ranking boundary.
-9. **API services have no composition root.** `create_app()` registers routes but never supplies
-   `search_service`, `review_service`, `source_service`, `sync_service`, or
-   `review_detail_service`.
-
-## Ordered implementation plan
-
-### 0. Make the repository runnable and establish test infrastructure
-
-**Effort: 1–2 days**
-
-Files:
-
-- root `uv.lock`, `pyproject.toml`
-- `.env.example`
-- `compose.yaml`
-- `.github/workflows/ci.yml`
-- `tests/conftest.py` and package-local `tests/`
-
-Work:
-
-- Regenerate a valid lockfile with `uv lock`; verify `uv sync --frozen`.
-- Add `compose.yaml` using `pgvector/pgvector:pg16`, with a health check and a disposable test
-  database. Document `DATABASE_URL` and `TEST_DATABASE_URL` in `.env.example`.
-- Add CI jobs for `ruff check`, `mypy`, unit tests, and Postgres integration tests.
-- Configure pytest markers (`unit`, `integration`, `live`) so normal CI never requires Notion,
-  Anthropic, or embedding API credentials.
-- Add basic import tests for every package. This immediately catches the currently missing Storage
-  modules and package dependency mistakes.
-- Add fixture factories for tenant IDs, source snapshots, normalized documents/chunks, extraction
-  envelopes, and ACLs.
-
-Exit criteria:
-
-- `uv sync --frozen`, `uv run ruff check .`, `uv run mypy packages apps`, and `uv run pytest` execute
-  successfully.
-- CI starts Postgres with `vector` and `pgcrypto` available.
-
-Why first: no later estimate is credible until contributors and CI can run the same environment.
-
-### 1. Lock down the two high-risk pure transformations with a thin spike
-
-**Effort: 2–3 days**
-
-Files:
-
-- `packages/connectors/src/cognitio_connectors/notion/render.py` (new)
-- `packages/pipeline/src/cognitio_pipeline/normalization.py` (new)
-- `packages/pipeline/src/cognitio_pipeline/chunking.py` (new)
-- `packages/extraction/src/cognitio_extraction/prompt.py`
-- `packages/extraction/src/cognitio_extraction/client.py`
-- `packages/extraction/src/cognitio_extraction/validator.py`
-- corresponding unit fixtures/tests
-
-Work:
-
-- Implement a deterministic Notion block renderer for the initial supported set: paragraph,
-  headings, bulleted/numbered list items, to-do, quote, code, callout, toggle, child page, and
-  table/table-row. Preserve operative wording; include stable separators and block IDs in metadata,
-  not in visible text.
-- Define normalization rules explicitly: UTF-8 decode, newline normalization, Unicode normalization,
-  and conservative whitespace handling. Do not collapse text in ways that change meaning.
-- Implement deterministic chunking with document-global offsets, configurable maximum size and
-  overlap, and `sha256(normalized_text[start_char:end_char])`.
-- Use deterministic chunk IDs derived from source version plus boundary/hash, not random UUIDs.
-- Change the extraction boundary so the model returns chunk-local spans; translate them to
-  document-global offsets before `SpanVerifier.verify_envelope()`.
-- Add golden tests proving that rendering and chunking the same block tree twice produces identical
-  text, boundaries, IDs, hashes, and evidence offsets.
-- Add one opt-in live Claude test over a fixed fixture. Measure schema-validation and span-verification
-  success; save sanitized failures as test fixtures.
-
-Exit criteria:
-
-- A fixed Notion fixture deterministically produces stable text/chunks.
-- A sample decision or fact extracted from a non-zero-offset chunk verifies against the full
-  normalized document.
-
-Why now: stable provenance is Cognitio's trust boundary. If this fails, storage and orchestration
-work should not hide the problem.
-
-### 2. Implement the minimal Storage layer and forward migration
-
-**Effort: 4–6 days**
-
-Files:
-
-- `packages/storage/src/cognitio_storage/models.py` (new)
-- `packages/storage/src/cognitio_storage/db.py` (new)
-- `packages/storage/src/cognitio_storage/types.py` (new)
-- `packages/storage/src/cognitio_storage/repositories/` (new package)
-- `packages/storage/alembic.ini` (new)
-- `packages/storage/src/cognitio_storage/migrations/env.py` (new)
-- `packages/storage/src/cognitio_storage/migrations/versions/0001_initial.py` (new)
-
-Tables required for the vertical slice:
-
-- `source_items`
-- `source_versions`
-- `normalized_documents`
-- `normalized_chunks` (fill the skeleton gap described above)
-- `extractions`
-- `entity_mentions`
-- `embeddings`
-- `jobs`
-- `change_events`
-- `connector_sync_states`
-- `connector_scan_items`
-- `review_items`
-- `cost_events`
-- `principals`
-
-Defer `entities`, `entity_merges`, `edges`, and `conflicts` until the narrow slice works, unless
-creating the full initial migration is cheaper than staging a second migration. If included, leave
-their services unwired.
-
-Required constraints/indexes:
-
-- `tenant_id NOT NULL` everywhere and tenant-scoped unique keys.
-- Partial unique indexes for current source versions/documents/extractions.
-- Unique source item `(tenant_id, connector, source_id)`.
-- Immutable source version `(tenant_id, source_item_id, content_hash)`.
-- Extraction fingerprint uniqueness for current rows.
-- Evidence-spans non-empty check and Gold/gold-source consistency check.
-- Job dedupe uniqueness that permits multiple rows when `dedupe_key IS NULL`; do not let SQL `NULL`
-  semantics accidentally weaken intended idempotency.
-- Embedding uniqueness by object and model version, plus an HNSW partial index for the active
-  dimension/version.
-- Foreign keys that are tenant-safe where practical. Avoid a cross-tenant UUID reference merely
-  because IDs are globally unique in normal operation.
-
-Repositories/functions needed immediately:
-
-- `SourceItemRepository.upsert_ref()`, `get_for_update()`, `advance_revision()`,
-  `set_current_version()`, `archive_missing()`
-- `SourceVersionRepository.insert_if_new()`, `get()`, `get_current()`
-- `NormalizedDocumentRepository.insert()`, `get()`
-- `NormalizedChunkRepository.replace_for_document()`, `list_for_document()`,
-  `get_by_chunk_id()`, `diff_against_previous_version()`
-- `ExtractionRepository.insert_if_absent()`, `by_chunk()`, `mark_stale()`,
-  `mark_rederived()`, `searchable_text()`
-- `EmbeddingRepository.upsert()`, `semantic_candidates()`
-- `CostEventRepository.insert()`
-- `ChangeEventRepository.insert_if_absent()`, `mark_done()`, `mark_failed()`
-- `ConnectorSyncStateRepository.load()`, `checkpoint()`, `record_health()`
-- `JobRepository.enqueue()`, `claim()`, `complete_with_follow_ons()`, `fail()`,
-  `requeue_stuck()`
-
-Implement `Uow` with an async SQLAlchemy session and repository properties. Add migration tests that
-upgrade an empty database to head and exercise every constraint above.
-
-Exit criteria:
-
-- An integration test inserts one complete source → version → document → chunk → extraction →
-  embedding chain and reads it back tenant-scoped.
-- Concurrent revision and fingerprint tests prove regressions/duplicates are no-ops.
-- Migration upgrade succeeds on a clean Postgres instance.
-
-Why here: every connector, pipeline, review, and query operation depends on these transactional
-primitives.
-
-### 3. Fix and implement the job queue transaction contract
-
-**Effort: 2–3 days**
-
-Files:
-
-- `packages/pipeline/src/cognitio_pipeline/queue.py`
-- `packages/pipeline/src/cognitio_pipeline/worker.py`
-- `packages/storage/src/cognitio_storage/repositories/jobs.py`
-- `packages/storage/src/cognitio_storage/db.py`
-
-Work:
-
-- Replace the marker `Transaction` with a typed transaction/UoW protocol exposing the repositories
-  handlers use.
-- Make one operation own the atomic boundary. Recommended shape:
-  `JobRunner.run_claimed(job)` opens `async with uow`, invokes the handler, writes its domain rows,
-  marks the job done, and enqueues follow-ons before commit.
-- Keep `claim()` short-lived and atomic using `FOR UPDATE SKIP LOCKED`; do not hold a database row
-  lock across Notion/model network calls. Claim by changing status, then execute externally, then
-  finalize in a new transaction with an ownership/status guard.
-- Implement exponential retry, `run_after`, dead-letter transition, and stale-processing-job reaper.
-- Validate persisted payloads through the discriminated `JobPayload` union when enqueueing and
-  loading.
-- Add concurrency tests with two workers, crash-after-handler/finalization tests, dedupe tests, and
-  retry/dead-letter tests.
-
-Exit criteria:
-
-- No job is executed by two healthy workers.
-- A crash cannot leave a completed domain write without either completing the job and enqueueing its
-  children or safely retrying idempotently.
-
-Why before handlers: the queue's correctness determines whether every later stage can be retried.
-
-### 4. Implement a fixture connector and the Notion fetch/reconciliation path
-
-**Effort: fixture connector 1 day; Notion connector 4–6 days**
-
-Files:
-
-- `packages/connectors/src/cognitio_connectors/fixture.py` (new)
-- `packages/connectors/src/cognitio_connectors/notion/client.py`
-- `packages/connectors/src/cognitio_connectors/notion/connector.py`
-- `packages/connectors/src/cognitio_connectors/notion/render.py`
-- `packages/connectors/src/cognitio_connectors/sync_state.py`
-- `packages/pipeline/src/cognitio_pipeline/jobs/reconcile.py` (new)
-- `packages/pipeline/src/cognitio_pipeline/jobs/fetch.py`
-- `packages/pipeline/src/cognitio_pipeline/types.py`
-
-Work:
-
-- Add an in-memory/fixture connector implementing the full `Connector` protocol. Use it for
-  deterministic end-to-end CI before involving external APIs.
-- Implement an `httpx` Notion API adapter with auth, API version header, pagination, timeout,
-  rate-limit handling, and bounded retries.
-- Implement scoped `full_scan()` from configured roots, recursive `fetch_children()`, complete
-  block-tree `fetch()`, canonical raw JSON serialization, content hash, source timestamp, and a
-  monotonic per-item revision.
-- Add a `RECONCILE` job type. It loads `connector_sync_states`, scans pages, idempotently records
-  `change_events`, upserts `source_items`, and enqueues `FETCH` jobs. Checkpoint only after each page
-  of scan events is durably recorded.
-- On a successful completed full scan, compare `connector_scan_items` with the previous generation
-  and emit tombstones/archive missing source items. Never infer deletion from a failed/partial scan.
-- Store explicit health timestamps and last error so token expiry is distinguishable from no
-  changes.
-- For the Notion ACL limitation, inject a configured fallback `AccessDescriptor` and preserve it in
-  `source_versions.acl_snapshot`.
-
-Exit criteria:
-
-- Fixture reconciliation creates source/change/fetch jobs idempotently.
-- A recorded Notion fixture with nested/paginated blocks produces one canonical snapshot.
-- Repeating an unchanged scan does not create a new source version.
-- An out-of-order fetch cannot replace a newer version.
-
-Why: connector synchronization is the second major product risk and unlocks the real ingestion path.
-
-### 5. Implement normalize, chunk, and invalidation handlers
-
-**Effort: 3–4 days**
-
-Files:
-
-- `packages/pipeline/src/cognitio_pipeline/jobs/normalize.py`
-- `packages/pipeline/src/cognitio_pipeline/jobs/chunk.py`
-- `packages/pipeline/src/cognitio_pipeline/jobs/invalidate.py`
-- transformation modules from Step 1
-
-Work:
-
-- `NormalizeHandler.run()` loads immutable raw content, renders/normalizes it, creates one
-  `normalized_documents` row, and enqueues `CHUNK`.
-- `ChunkHandler.run()` computes/stores deterministic `normalized_chunks`, compares them with the
-  previous current source version, and enqueues:
-  - `EXTRACT` for new/changed chunks;
-  - `INVALIDATE` for prior chunks that disappeared or changed.
-- Do not enqueue `EMBED` yet; extraction embeddings are created after validated extraction.
-- `InvalidateHandler.run()` marks only current extractions derived from affected prior chunks stale.
-  Re-extraction is driven by the new chunk's normal `EXTRACT` job; removed chunks archive or
-  supersede prior records according to an explicit policy.
-- Keep current-row swaps and child-job enqueue in the finalization transaction.
-
-Exit criteria:
-
-- Changing one paragraph in a multi-chunk fixture schedules extraction only for affected chunks.
-- Unchanged chunks retain their extractions; removed chunks cannot appear as current search results.
-- Re-running any handler is a no-op beyond already-deduplicated jobs/rows.
-
-Why: this proves the incremental mechanism before adding model and embedding cost.
-
-### 6. Complete extraction persistence and review-item creation
-
-**Effort: 4–5 days**
-
-Files:
-
-- `packages/extraction/src/cognitio_extraction/client.py`
-- `packages/extraction/src/cognitio_extraction/prompt.py`
-- `packages/extraction/src/cognitio_extraction/mapping.py` (new)
-- `packages/pipeline/src/cognitio_pipeline/jobs/extract.py`
-- relevant Storage repositories
-
-Work:
-
-- Implement the Anthropic `StructuredClaudeClient` adapter using structured outputs and the
-  `ExtractionEnvelope.model_json_schema()`.
-- Add one bounded repair/retry for schema or span failures. Preserve sanitized failure metadata on
-  the job/dead letter; never write a partially valid envelope.
-- Map decisions/actions/facts/open questions to individual `extractions` with:
-  `node_type`, typed payload, promoted fields, translated global evidence spans, per-record
-  fingerprint, confidence, inherited ACL, `trust_state=extracted`,
-  `workflow=pending_review`, and current/version fields.
-- Store entity outputs as `entity_mentions`; defer canonical resolution. Skip relationship/edge
-  persistence in the first slice unless both referenced records were persisted successfully.
-- Insert exactly one `cost_events` row per model call in the same successful extraction transaction.
-- Create one open `review_items` row per persisted extraction. Phase 1 must never auto-promote.
-- Enqueue one `EMBED` job per new extraction with a dedupe key containing extraction ID and model
-  version.
-
-Tests:
-
-- schema rejection, local-ID validation, span translation/verification, fingerprint idempotency,
-  ACL inheritance, promoted fields, one-cost-row guarantee, and no partial writes.
-
-Exit criteria:
-
-- A fixture or live model response atomically creates validated extractions, mentions, review items,
-  cost event, and embedding follow-ons.
-- Re-running extraction creates no duplicate current extraction or review item.
-
-Why: this is the central trust boundary and completes connector → storage → extraction.
-
-### 7. Implement extraction embeddings and ACL-safe semantic query
-
-**Effort: 3–4 days**
-
-Files:
-
-- `packages/pipeline/src/cognitio_pipeline/jobs/embed.py`
-- `packages/query/src/cognitio_query/search.py`
-- `packages/query/src/cognitio_query/acl.py`
-- `packages/query/src/cognitio_query/repositories.py` (new)
-- `packages/api/src/cognitio_api/routes/search.py`
-
-Work:
-
-- Add an embedding provider protocol shared by indexing and query; implement the configured
-  `text-embedding-3-small` adapter and a deterministic fake for tests.
-- Define canonical searchable text by node type (for example decision title + decision, fact claim,
-  action description). `EmbedHandler` loads this text and upserts an extraction embedding pinned to
-  a full model/version identifier.
-- Resolve principal/source identities before candidate lookup. Change
-  `SemanticSearchRepository.candidates()` to accept `ResolvedAcl`, and apply tenant, lifecycle,
-  `is_current`, model version, similarity floor, and effective-ACL predicates in SQL before `LIMIT`.
-- Make search **hybrid lexical + vector**, not pure-pgvector. Add a `tsvector`/GIN full-text index
-  over the searchable content of `normalized_documents` and `extractions` (decision title/text,
-  fact claim, action description) — add the FTS columns/indexes to the migration. Run an ANN leg and
-  an FTS leg, both with the **same ACL/tenant/lifecycle/`is_current` predicates applied in SQL before
-  `LIMIT`**, then fuse the two result sets with **Reciprocal Rank Fusion (RRF)** (or weighted-score
-  fusion) into the final ranking. Exact-term queries (names, IDs, error strings) must be reachable
-  via the lexical leg.
-- Join extraction → source version → source item to build `SearchCandidate`/`SourceSummary`; return
-  evidence/provenance via the source drilldown, not hidden ad-hoc SQL in the API.
-- Keep disputed/stale weighting already present in `SearchService`, but exclude archived and
-  superseded records.
-- Add two-tenant and denied-principal integration tests proving an invisible high-similarity record
-  cannot displace visible results or leak through source endpoints.
-
-Exit criteria:
-
-- Querying a phrase from the ingested page returns its extraction with similarity, tier,
-  freshness, source URL, and no cross-tenant/ACL leakage.
-
-Why: this completes the requested narrow end-to-end prototype.
-
-### 8. Wire runnable worker and API composition roots; add an end-to-end test
-
-**Effort: 2–3 days**
-
-Files:
-
-- `apps/worker/src/cognitio_worker/main.py`
-- `packages/api/src/cognitio_api/main.py`
-- `packages/api/src/cognitio_api/composition.py` (new)
-- concrete source/sync/detail services under `packages/api/src/cognitio_api/`
-- `tests/e2e/test_fixture_vertical_slice.py`
-
-Work:
-
-- Load typed settings for database, Notion, Anthropic, embedding model/version, worker polling, and
-  connector scope.
-- Register connector instances and all implemented handlers in the worker.
-- Supply concrete `sync_service`, `search_service`, `source_service`, and review-detail services on
-  FastAPI lifespan startup. Keep route modules transport-only.
-- Add readiness checks for DB connectivity/extensions and configured provider clients; retain
-  `/healthz` as a process liveness check.
-- End-to-end CI test: fixture connector reconciliation → run jobs until idle → assert source,
-  normalized text/chunks, extraction, review item, embedding → call `/search` with tenant/principal
-  headers → verify provenance.
-
-Exit criteria:
-
-- `uv run cognitio-worker` and the API start from documented environment variables.
-- The fixture-backed end-to-end test passes without network access.
-- A manual Notion smoke test can ingest one configured page and find one extracted record.
-
-### 9. Add manual review to complete the trust loop
-
-**Effort: 3–4 days**
-
-Files:
-
-- `packages/review/src/cognitio_review/queue.py`
-- Storage review repository
-- `packages/api/src/cognitio_api/routes/review.py`
-- review/source detail services
-
-Work:
-
-- Implement cursor-paginated review listing and evidence-first detail retrieval.
-- In one transaction:
-  - confirm → `trust_state=gold`, `gold_source=human_review`, `workflow=none`;
-  - edit → validate payload for the extraction node type, version/supersede the old extraction,
-    create corrected Gold, preserve evidence, and record `before`/`after`;
-  - reject → archive the extraction and record the negative decision.
-- Require tenant and ACL checks on detail and mutation paths. Header auth remains a development-only
-  boundary.
-- Test concurrent decisions, repeated requests, invalid edits, and audit immutability.
-
-Exit criteria:
-
-- One extracted record can be confirmed into Gold and immediately ranks with the Gold weight.
-- Every decision has an immutable audit row.
-
-Why after search: review is easier to validate when the trust-state change has visible query
-behavior, while not blocking the first end-to-end slice.
-
-### 10. Harden incremental operation and production diagnostics
-
-**Effort: 4–6 days**
-
-Files:
-
-- connector/pipeline maintenance jobs
-- API sync/source status services
-- logging/metrics configuration
-- runbooks in `docs/`
-
-Work:
-
-- Add scheduled reconciliation, stuck-job reaping, dead-letter inspection/retry, connector health,
-  queue-depth, stale-extraction backlog, validation-failure rate, and cost summaries.
-- Test a real page edit: a changed chunk creates a new source version, stales only affected
-  extractions, re-extracts, and prevents old/current duplicates in search.
-- Implement deletion lifecycle for reconciliation tombstones. Keep right-to-deletion and
-  crypto-shredding as a separate, explicitly tracked security milestone; do not imply ordinary
-  archival satisfies it.
-- Add query/promotion access audit rows or a dedicated audit table before inviting multiple users.
-- Build a small golden extraction fixture set and report precision/recall and review override rate
-  before changing prompts/models.
-
-Exit criteria:
-
-- The vertical slice survives retries, out-of-order fetches, one-page edits, no-op rescans, worker
-  crashes, and tombstones.
-- Operators can distinguish idle, backlogged, rate-limited, credential-failed, and dead-lettered
-  states.
-
-## Critical path and parallel work
-
-Critical path:
-
-```text
-tooling → provenance spike → storage/UoW → queue contract → fixture connector
-→ normalize/chunk → extraction persistence → embedding/search → composition/e2e
-```
-
-Expected time to the fixture-backed end-to-end prototype: **21–32 engineering days**.
-Expected time to a Notion-backed prototype with manual Gold review and basic hardening:
-**32–48 engineering days**.
-
-After Step 2 defines stable repository contracts, work can split:
-
-- Engineer A: queue, handlers, worker composition.
-- Engineer B: Notion client/rendering/reconciliation.
-- Engineer C: extraction adapter/mapping and embedding/query.
-
-Storage schema and offset semantics should not be developed independently in parallel because both
-define the durable provenance contract.
-
-## Build and test in isolation
-
-- **Pure unit tests:** Notion rendering, normalization, chunk boundaries/hashes, prompt construction,
-  offset translation, span verification, fingerprints, retry pricing/policy, ACL set logic, search
-  scoring, promotion policy.
-- **Postgres integration tests:** migrations, partial unique indexes, monotonic revisions, job
-  claiming/dedupe/retry, current-row swaps, extraction idempotency, ANN queries, tenant and ACL
-  predicates, review transactions.
-- **Contract tests with fakes:** Connector protocol, structured Claude client, embedding provider,
-  worker handler DAG.
-- **Recorded API fixtures:** Notion pagination/block trees/rate limits; sanitized Claude structured
-  responses. Keep live tests opt-in.
-- **End-to-end test:** use the fixture connector and fake model/embedder in CI; reserve a separate
-  smoke test for real Notion and provider credentials.
-
-## Explicitly defer
-
-Do not put these on the prototype critical path:
-
-- canonical entity resolution beyond storing mentions;
-- `supports`/`contradicts`, conflict detection, and dispute resolution;
-- auto-promotion;
-- graph traversal/GAG and synthesized records;
-- second connector and cross-source identity resolution;
-- materialized `related_to` edges;
-- React review UI (exercise review through API first);
-- graph database, external queue, or external vector database.
-
-They remain compatible with the proposed schema, but none is required to prove one trustworthy
-incremental source-backed extraction can be found and reviewed.
-
-## Phase 2 / Phase 3 follow-on notes
-
-These are not on the prototype critical path, but they extend deferred work and should be scheduled
-with the phase that lights up each subsystem.
-
-- **Phase 2 — blocking index for entity resolution and contradiction candidates.** When the entity
-  resolution pass and the contradiction detector are built, include building the **two-stage blocking
-  index** so neither does an O(n²) all-pairs scan: a `pg_trgm` GIN index on normalized entity
-  names/aliases (and on normalized claim text) for the lexical block, plus pgvector ANN over
-  entity/fact embeddings filtered by shared subject entity for the semantic block. Only the union of
-  both blocks reaches the expensive resolution model / contradiction classifier.
-- **Phase 2 — calibrate edge thresholds.** The materialization thresholds and fan-out caps for
-  `supports`/`contradicts` (`supports` ≥ 0.7, ≤ 50/Gold fact; `contradicts` ≥ 0.8, ≤ 20) are
-  starting points. Calibrate them against the **contradiction-detector eval set** before relying on
-  the materialized edges, balancing false positives (queue flood) against false negatives (silent
-  Gold corruption).
-- **Phase 3 — head-to-head GAG vs. flat-RAG eval.** As a Phase 3 milestone alongside GAG, add an A/B
-  eval: graph-augmented generation vs. flat semantic RAG on the **same question set**, graded by a
-  **blind LLM-as-judge**, tracking answer-quality, token-usage, and tool-call-count deltas. This is
-  the test that proves the graph earns its added complexity.
+Then prove incremental re-indexing, conflict-safe graph growth, and whether graph-augmented
+generation beats flat RAG.
+
+## Final review findings
+
+- **Order:** Infrastructure must be runnable before estimates are meaningful, and Storage contracts
+  must land before connector, queue, review, or query implementations. Pure rendering/extraction
+  fixtures can be developed early, but durable handlers depend on the schema and `Uow`.
+- **Missing prerequisites in the old plan:** valid lockfile, settings and environment contract,
+  Docker Compose, test fixtures, CI, migration smoke tests, fixture connector, API/worker
+  composition roots, access audit, readiness checks, and operational maintenance jobs.
+- **Oversized steps:** the old Storage, Notion, extraction, search, and hardening steps each mixed
+  several independently risky changes. They were not credible 2–6 day solo tasks. The tasks below
+  are scoped to 2–6 focused hours each; allow **6–9 calendar weeks** for one experienced developer
+  after integration/debugging contingency, provider/API surprises, and review.
+- **Four codebase-memory-mcp improvements:** hybrid lexical/vector retrieval is on the Phase 1
+  critical path; MinHash/LSH blocking is explicit rather than being approximated only by trigram
+  search; persisted `supports`/`contradicts` edges enforce confidence floors and per-node caps; and
+  GAG must pass a blind head-to-head evaluation against flat RAG.
+- **Stub gaps:** Storage imports nonexistent `models.py` and `db.py`; all pipeline handlers and the
+  worker composition root are stubs; `EmbedPayload` incorrectly requires a chunk for extraction
+  embeddings; no `RECONCILE` job exists; extraction prompts describe document-global offsets even
+  though the model sees chunk-local text; search filters ACLs after ANN limiting; API routes have no
+  concrete services; and `entity_resolve.py`, `conflicts.py`, and `graph.py` do not yet encode the
+  blocking, edge-cap, or evaluation contracts required by the design.
+
+Each numbered item below is intended to fit one focused 2–6 hour coding session. Dependencies refer
+to task numbers, not phase names.
+
+## Phase 0: Infra
+
+1. **Repair the uv workspace and lockfile** *(2–4h)*
+   - **Implement:** Regenerate root `uv.lock`; correct dependency/version conflicts in root and
+     member `pyproject.toml` files; add missing test/runtime dependencies only where used.
+   - **Acceptance:** `uv sync --frozen` succeeds from a clean checkout and every package imports.
+   - **Dependencies:** None.
+
+2. **Define typed application settings** *(3–5h)*
+   - **Implement:** Add a small settings module used by `packages/api` and `apps/worker`, covering
+     `DATABASE_URL`, `TEST_DATABASE_URL`, Notion token/root IDs, Anthropic key/model, embedding
+     provider/model version, fallback ACL principals, and worker timing; add `.env.example`.
+   - **Acceptance:** Unit tests validate required fields, defaults, secret redaction, and invalid
+     URLs; API and worker can construct settings without reading environment variables directly.
+   - **Dependencies:** 1.
+
+3. **Add local Postgres infrastructure** *(2–4h)*
+   - **Implement:** Add `compose.yaml` using `pgvector/pgvector:pg16`, health checks, persistent dev
+     storage, and a disposable test database; document start/stop/reset commands in `README.md`.
+   - **Acceptance:** `docker compose up -d` reaches healthy state and both databases expose
+     `vector` and `pgcrypto`.
+   - **Dependencies:** 1.
+
+4. **Create the test harness and fixture factories** *(4–6h)*
+   - **Implement:** Configure pytest markers `unit`, `integration`, and `live`; add root
+     `tests/conftest.py` with database lifecycle helpers and factories for tenants, ACLs, source
+     snapshots, normalized documents/chunks, extraction envelopes, and jobs.
+   - **Acceptance:** Unit tests run without Docker or provider credentials; integration tests skip
+     with an actionable message when `TEST_DATABASE_URL` is absent.
+   - **Dependencies:** 1, 3.
+
+5. **Add dependency-boundary checks and continuous integration** *(4–6h)*
+   - **Implement:** Add smoke tests importing all packages, a check that rejects upward layer
+     imports according to `AGENTS.md`, and `.github/workflows/ci.yml` with frozen install,
+     `ruff check`, `mypy`, unit tests, and pgvector-backed integration tests; exclude `live` tests.
+   - **Acceptance:** Missing modules and invalid upward imports fail locally and in CI; CI runs the
+     same commands documented for local development and fails on lint, type, migration, or tests.
+   - **Dependencies:** 1, 3, 4.
+
+## Phase 1: Storage + Connectors
+
+6. **Create SQLAlchemy base types and database lifecycle** *(4–6h)*
+   - **Implement:** Add `packages/storage/src/cognitio_storage/models.py`, `types.py`, and `db.py`
+     with naming conventions, UUID/timestamp helpers, async engine/session factories, and an async
+     `Uow` commit/rollback context.
+   - **Acceptance:** `cognitio_storage` imports successfully; unit tests prove `Uow` commits on
+     success and rolls back on error.
+   - **Dependencies:** 1, 4.
+
+7. **Model source, sync, and normalization tables** *(4–6h)*
+   - **Implement:** In `models.py`, define `source_items`, `source_versions`,
+     `normalized_documents`, typed `normalized_chunks`, `change_events`,
+     `connector_sync_states`, and `connector_scan_items`, including tenant-safe foreign keys and
+     current-row constraints.
+   - **Acceptance:** Metadata tests assert all required columns, unique keys, revision fields,
+     chunk offsets/hashes, scan generations, checkpoint health, and tenant predicates exist.
+   - **Dependencies:** 6.
+
+8. **Model extraction, review, and embedding tables** *(4–6h)*
+   - **Implement:** Define `extractions`, `entity_mentions`, `embeddings`, `review_items`,
+     `principals`, and `cost_events`; add non-empty evidence checks, Gold/gold-source consistency,
+     promoted query columns, searchable text/`tsvector`, and model-version uniqueness.
+   - **Acceptance:** Metadata tests cover extraction fingerprint/current uniqueness, review audit
+     fields, one embedding per object/version, and all required indexes.
+   - **Dependencies:** 6.
+
+9. **Model queue, entity, conflict, edge, and audit tables** *(4–6h)*
+    - **Implement:** Define `jobs`, `entities`, `entity_merges`, `edges`, `conflicts`,
+      `access_audit_events`, and `blocking_signatures`; preserve no-FK polymorphic edges and include
+      fields needed for MinHash signatures, edge provenance, thresholds, and evaluation sampling.
+    - **Acceptance:** Metadata tests cover nullable job dedupe semantics, claim index, conflict
+      status index, edge lookup indexes, and immutable audit payloads.
+   - **Dependencies:** 6.
+
+10. **Create and verify the initial Alembic migration** *(4–6h)*
+    - **Implement:** Add Alembic configuration/environment and `0001_initial.py`; create
+      `pgcrypto`/`vector`, enums, tables, partial unique indexes, GIN FTS/trigram indexes, and the
+      active-version HNSW index explicitly.
+    - **Acceptance:** A clean database upgrades to head; schema inspection matches tasks 7–9; a
+      dev-only downgrade and re-upgrade succeeds.
+   - **Dependencies:** 7, 8, 9.
+
+11. **Implement source and sync repositories** *(4–6h)*
+    - **Implement:** Add repositories for source items/versions, change events, sync states, and
+      scan membership with `upsert_ref`, monotonic `advance_revision`, `insert_if_new`,
+      checkpoint/health updates, generation completion, and archive-missing operations.
+    - **Acceptance:** Integration tests prove duplicate events/snapshots are no-ops, revisions
+      cannot regress, checkpoints advance on empty pages, and incomplete scans never archive data.
+   - **Dependencies:** 10.
+
+12. **Implement document, chunk, and extraction repositories** *(4–6h)*
+    - **Implement:** Add normalized document/chunk insert/get/diff methods and extraction
+      insert/version/stale/archive/searchable-text methods; expose them through `Uow`.
+    - **Acceptance:** An integration test writes and reads a tenant-scoped
+      source→version→document→chunk→extraction chain; duplicate fingerprints and cross-tenant reads
+      are rejected.
+   - **Dependencies:** 10.
+
+13. **Implement queue, review, embedding, edge, and audit repositories** *(4–6h)*
+    - **Implement:** Add typed repositories for jobs, review items, embeddings, entities/conflicts,
+      capped edges, blocking signatures, costs, principals, and access audits.
+    - **Acceptance:** Repository integration tests cover job dedupe, open-review lookup, embedding
+      upsert, immutable audit insertion, and edge writes that can be transactionally guarded.
+   - **Dependencies:** 10.
+
+14. **Build a deterministic fixture connector** *(3–5h)*
+    - **Implement:** Add `packages/connectors/src/cognitio_connectors/fixture.py` implementing the
+      full `Connector` protocol, including pagination, edits, permission changes, tombstones,
+      failures, and stable content hashes.
+    - **Acceptance:** Contract tests exercise full/incremental scans, child expansion, fetch,
+      retries, tombstones, and deterministic replay without network access.
+    - **Dependencies:** 4.
+
+15. **Implement the Notion HTTP adapter and recorded fixtures** *(4–6h)*
+    - **Implement:** Replace the `NotionApi` protocol-only boundary with an `httpx` adapter handling
+      auth/version headers, pagination, timeouts, `429 Retry-After`, bounded retries, and typed error
+      mapping; add sanitized recorded responses.
+    - **Acceptance:** Tests cover multi-page search/children, timeout, 429, 5xx, and malformed
+      responses without live credentials.
+    - **Dependencies:** 2, 4.
+
+16. **Implement deterministic Notion rendering** *(4–6h)*
+    - **Implement:** Add `notion/render.py` for paragraph, headings, lists, to-do, quote, code,
+      callout, toggle, child page, table, and table-row blocks; preserve block IDs as metadata and
+      use stable visible separators.
+    - **Acceptance:** Golden fixtures render identically across runs and preserve exact text needed
+      for evidence offsets.
+   - **Dependencies:** 14, 15.
+
+17. **Implement scoped Notion scanning and fetching** *(4–6h)*
+    - **Implement:** Complete `NotionConnector.full_scan`, `incremental_scan`, `fetch_children`, and
+      `fetch`; scope traversal to configured roots, serialize canonical raw JSON, derive monotonic
+      revisions, and apply the configured fallback ACL with `permission_metadata=False`.
+    - **Acceptance:** Recorded nested/paginated fixtures produce stable refs and snapshots;
+      unchanged fetches keep the same hash; out-of-scope pages are excluded.
+   - **Dependencies:** 15, 16.
+
+18. **Implement reconciliation and tombstone detection** *(4–6h)*
+    - **Implement:** Add connector reconciliation service logic using tasks 11 and 17: persist each
+      page of events before checkpointing, track scan generations, update health, and emit
+      tombstones only after a successful completed full scan.
+    - **Acceptance:** Repeated scans are idempotent; empty scans advance health/checkpoints; failed
+      partial scans archive nothing; a missing prior member is archived after a complete scan.
+   - **Dependencies:** 11, 14, 17.
+
+## Phase 2: Pipeline + Extraction
+
+19. **Define payloads and implement SKIP LOCKED queue operations** *(4–6h)*
+    - **Implement:** Add `RECONCILE` and maintenance payloads, fix extraction embedding payloads,
+      and update the Pipeline README DAG; back `JobQueue.enqueue`, `claim`, `fail`, and
+      `requeue_stuck` with short `FOR UPDATE SKIP LOCKED` transactions, ownership, exponential
+      backoff, dead-letter state, and JSON validation through the `JobPayload` union.
+    - **Acceptance:** Payloads round-trip through JSON; two workers never receive one healthy job;
+      retry timing, max-attempt, stale-lock, and dedupe tests pass.
+    - **Dependencies:** 13, 18.
+
+20. **Make handler finalization atomic** *(4–6h)*
+    - **Implement:** Replace the marker `Transaction` with a typed handler `Uow` protocol; add a
+      runner that performs idempotent domain writes, ownership-guarded completion, and follow-on
+      enqueue in one final transaction without holding locks during network calls.
+    - **Acceptance:** Crash-point tests show a retry cannot produce an unpaired domain write, job
+      completion, or child enqueue.
+    - **Dependencies:** 6, 19.
+
+21. **Add reconcile and fetch handlers** *(4–6h)*
+    - **Implement:** Add `jobs/reconcile.py`; complete `FetchHandler` using the connector registry,
+      monotonic source revision guard, immutable source-version insert, ACL snapshot, and deduped
+      `NORMALIZE` follow-on.
+    - **Acceptance:** Fixture reconciliation creates fetch work; unchanged and out-of-order
+      snapshots create no new current version or duplicate child job.
+    - **Dependencies:** 18, 19, 20.
+
+22. **Implement normalization rules and handler** *(3–5h)*
+    - **Implement:** Add `pipeline/normalization.py` with UTF-8/newline/Unicode and conservative
+      whitespace rules; complete `NormalizeHandler` to render connector content, persist one
+      document, and enqueue `CHUNK`.
+    - **Acceptance:** Golden fixtures normalize deterministically without changing operative
+      wording; rerunning the job is a no-op.
+    - **Dependencies:** 12, 16, 20, 21.
+
+23. **Implement stable chunking and chunk diffs** *(4–6h)*
+    - **Implement:** Add `pipeline/chunking.py` with configurable size/overlap, document-global
+      offsets, deterministic IDs, and SHA-256 text hashes; complete `ChunkHandler` to persist chunks
+      and enqueue only changed/new extraction plus prior-chunk invalidation.
+    - **Acceptance:** Repeated chunking is byte-stable; a one-paragraph edit schedules only affected
+      chunks; removed chunks are reported explicitly.
+    - **Dependencies:** 12, 20, 22.
+
+24. **Implement per-record invalidation and supersession** *(3–5h)*
+    - **Implement:** Complete `InvalidateHandler` and extraction repository transitions for changed
+      and removed chunks; mark affected current extractions stale, archive removed derivations, and
+      preserve unaffected records.
+    - **Acceptance:** Integration tests show unchanged extractions remain current, stale flags clear
+      only after replacement commits, and removed-chunk records disappear from current search.
+    - **Dependencies:** 12, 20, 23.
+
+25. **Make extraction offsets explicitly chunk-local** *(3–5h)*
+    - **Implement:** Update `extraction/prompt.py`, `client.py`, and `validator.py` so model output
+      offsets address `Chunk.text`, then translate every record/relationship span by
+      `chunk.start_char` before validating against the full normalized document.
+    - **Acceptance:** Unit tests verify valid spans from a non-zero-offset chunk and reject
+      out-of-range, mismatched, or already-global model spans.
+    - **Dependencies:** 4, 23.
+
+26. **Implement the Anthropic structured-output adapter** *(4–6h)*
+    - **Implement:** Add a concrete `StructuredClaudeClient` using the Anthropic SDK, schema-bound
+      output, timeouts, request IDs, token usage, and one bounded repair/retry for schema/span
+      failures; sanitize stored failure details.
+    - **Acceptance:** Recorded/fake tests cover success, malformed schema, span failure, repair
+      success, terminal failure, and exact token accounting; one opt-in `live` test is documented.
+    - **Dependencies:** 2, 25.
+
+27. **Map extraction envelopes to durable records** *(4–6h)*
+    - **Implement:** Add `extraction/mapping.py` to map decisions, actions, facts, open questions,
+      and entities to typed extraction/mention writes with promoted fields, global evidence,
+      fingerprints, inherited ACL, and canonical searchable text.
+    - **Acceptance:** Unit tests cover every node type, deterministic fingerprints, ACL inheritance,
+      invalid local references, and promoted field values.
+    - **Dependencies:** 8, 12, 25.
+
+28. **Complete the extraction handler transaction** *(4–6h)*
+    - **Implement:** Complete `ExtractHandler`: load document/chunk/context, call the extractor,
+      persist all-or-nothing extractions/mentions, exactly one cost row per model call, one open
+      review item per extraction, and deduped extraction `EMBED` jobs; do not persist relationships
+      until their endpoints exist.
+    - **Acceptance:** A retry creates no duplicate extraction, review item, cost event, or embed job;
+      any invalid record causes no partial durable output.
+    - **Dependencies:** 13, 20, 26, 27.
+
+29. **Implement embedding providers and handler** *(4–6h)*
+    - **Implement:** Add a shared embedding protocol, deterministic fake, and configured OpenAI
+      adapter; complete `EmbedHandler` to embed canonical extraction text and upsert by extraction
+      ID plus full model/version identifier.
+    - **Acceptance:** Fake-provider tests are deterministic; retries do not duplicate vectors;
+      model versions never share an ANN index/query space.
+    - **Dependencies:** 2, 13, 19, 20, 28.
+
+30. **Implement MinHash/LSH candidate blocking** *(4–6h)*
+    - **Implement:** Add `query/blocking.py` (or a lower-layer utility with no upward dependency) to
+      normalize claim/entity n-grams, compute deterministic MinHash signatures, assign LSH bands,
+      persist `blocking_signatures`, and union LSH candidates with trigram/ANN candidates filtered
+      by tenant and shared subject entity.
+    - **Acceptance:** Tests show near-duplicates enter the candidate set, unrelated records are
+      substantially pruned, signatures are reproducible, and candidate generation performs no
+      all-pairs scan.
+    - **Dependencies:** 9, 13, 27, 29.
+
+## Phase 3: Review + Query
+
+31. **Implement evidence-first review and provenance reads** *(4–6h)*
+    - **Implement:** Complete review list/get operations with stable cursor pagination and filters;
+      back `ReviewDetailService` and `SourceService` through Storage repositories with ACL-safe
+      extraction/source/version joins, evidence text, source URL, confidence, tier, freshness,
+      workflow, and provenance.
+    - **Acceptance:** Queue, detail, search-source, and drilldown tests return consistent exact
+      evidence only for visible tenant records; inaccessible objects return not-found without
+      revealing existence.
+    - **Dependencies:** 12, 13, 28.
+
+32. **Implement atomic review decisions** *(4–6h)*
+    - **Implement:** Implement confirm/edit/reject in one `Uow`: confirm promotes to human-reviewed
+      Gold; edit schema-validates, versions/supersedes the old extraction, and creates corrected
+      Gold; reject archives it; always preserve immutable before/after audit.
+    - **Acceptance:** Concurrent/repeated decisions are idempotent or conflict explicitly; invalid
+      edits roll back; every successful decision has reviewer/time/before/after.
+    - **Dependencies:** 12, 13, 27, 31.
+
+33. **Implement ACL-safe hybrid retrieval and RRF** *(4–6h)*
+    - **Implement:** Resolve `ResolvedAcl` before retrieval; add extraction/document FTS and
+      pgvector ANN repository queries that require identical tenant, allow/deny, lifecycle,
+      freshness/current, trust-state, and model-version predicates before `LIMIT`; fuse ranked IDs
+      with Reciprocal Rank Fusion and retain tier/freshness/dispute weighting.
+    - **Acceptance:** Exact names, IDs, and error strings are found lexically; semantic paraphrases
+      are found by ANN; an invisible higher-scoring record cannot displace a visible result;
+      deterministic RRF, two-tenant, and deny-precedence tests pass.
+    - **Dependencies:** 8, 10, 13, 29.
+
+34. **Implement contradiction detection and capped edge writes** *(4–6h)*
+    - **Implement:** Use task 30 candidates in a separately scored contradiction classifier;
+      persist `supports` only at confidence ≥0.7 with ≤50 outgoing edges per Gold fact and
+      `contradicts` only at ≥0.8 with ≤20; replace/drop the weakest edge transactionally; create
+      conflict sets and sample borderline cases for evaluation.
+    - **Acceptance:** Below-threshold edges are absent; caps survive concurrent writers; strongest
+      edges remain; high-confidence contradictions open one idempotent dispute set.
+    - **Dependencies:** 13, 26, 30, 32.
+
+35. **Implement bounded graph context assembly and edge GC** *(4–6h)*
+    - **Implement:** Complete `query/graph.py` with ACL-filtered seed search, typed traversal,
+      per-edge fan-out/node/depth/character budgets, depth-one computed `related_to`, provenance,
+      and dispute warnings; add an orphan-edge integrity/GC maintenance operation.
+    - **Acceptance:** Traversal never exceeds budgets, never crosses ACL/tenant boundaries, warns
+      on disputes, computes rather than stores `related_to`, and GC removes dangling edges.
+    - **Dependencies:** 31, 33, 34.
+
+## Phase 4: API + Eval
+
+36. **Wire worker and API composition roots** *(4–6h)*
+    - **Implement:** Add `cognitio_api/composition.py`; construct engine/Uow, repositories,
+      connectors, providers, handlers, search/review/source/sync/detail services, and worker
+      registry from typed settings; add graceful shutdown.
+    - **Acceptance:** `uv run cognitio-worker` and `uv run uvicorn cognitio_api.main:app` start from
+      `.env.example`-documented settings and no route returns “service not configured.”
+    - **Dependencies:** 2, 20, 21, 22, 23, 24, 28, 29, 31, 32, 33.
+
+37. **Add operational APIs, audit, and runbooks** *(4–6h)*
+    - **Implement:** Keep `/healthz` as liveness; add readiness for DB/extensions/provider config;
+      back connector health/reconcile routes, queue/dead-letter/stale-backlog/cost summaries, and
+      query/promotion access-audit writes; document setup, migration, reconciliation, dead-letter
+      replay, credential failure, model-version rollover, index rebuild, rollback, and the opt-in
+      real-provider smoke test.
+    - **Acceptance:** Operators can distinguish idle, backlogged, rate-limited, credential-failed,
+      and dead-lettered states; every search and review mutation emits a tenant/principal audit row;
+      a new developer can follow the runbook from a clean checkout.
+    - **Dependencies:** 5, 10, 13, 18, 19, 32, 33, 36.
+
+38. **Add fixture-backed end-to-end and incremental tests** *(4–6h)*
+    - **Implement:** Add `tests/e2e/test_fixture_vertical_slice.py`: reconcile fixture connector,
+      drain jobs, assert snapshot/document/chunks/extractions/review/embeddings, call review/search/
+      drilldown APIs, edit one paragraph, rerun, and verify selective invalidation.
+    - **Acceptance:** The complete test passes without network access and proves no-op rescans,
+      retries, current-row uniqueness, ACL isolation, Gold promotion, and changed-chunk-only work.
+    - **Dependencies:** 36, 37.
+
+39. **Build extraction and contradiction evaluation harnesses** *(4–6h)*
+    - **Implement:** Add versioned golden datasets and an `eval/` runner reporting extraction
+      precision/recall by node type, span-verification rate, review override rate, contradiction
+      precision/recall, prompt/model/version metadata, and regression thresholds.
+    - **Acceptance:** The runner produces machine-readable and human-readable reports and exits
+      nonzero when configured precision floors regress.
+    - **Dependencies:** 26, 27, 32, 34.
+
+40. **Run blind GAG vs flat-RAG head-to-head evaluation** *(4–6h)*
+    - **Implement:** Add a fixed question/corpus set and two answer paths using the same model:
+      flat hybrid RAG from task 33 and graph context from task 35; randomize labels for a blind
+      LLM-as-judge and record answer quality, token use, latency, and tool-call count.
+    - **Acceptance:** Repeated runs emit paired per-question results and aggregate confidence
+      intervals; the report states whether GAG improves quality enough to justify its added cost.
+    - **Dependencies:** 35, 39.
+
+## Completion boundary
+
+Tasks 1–38 deliver the trustworthy Phase-1 product slice with manual Gold review and hybrid search.
+Tasks 30 and 34 incorporate LSH blocking and edge-hairball controls needed before conflict features
+are trusted. Tasks 35 and 40 are the gate for retaining graph complexity: if GAG does not beat flat
+RAG at acceptable cost, keep hybrid retrieval and defer further graph expansion.
