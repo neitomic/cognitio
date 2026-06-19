@@ -33,6 +33,12 @@ generation beats flat RAG.
   though the model sees chunk-local text; search filters ACLs after ANN limiting; API routes have no
   concrete services; and `entity_resolve.py`, `conflicts.py`, and `graph.py` do not yet encode the
   blocking, edge-cap, or evaluation contracts required by the design.
+- **Remaining low-severity review gaps, folded into existing tasks (no renumbering):** the
+  crypto-shred columns (`enc_key_id` + encrypted `raw_content`) ARCHITECTURE requires from day 1 are
+  now explicit in task 7; the cheap "don't even fetch an unchanged page" pre-fetch gate (review gap
+  E) is explicit in task 17; the deletion fail-safe taxonomy (review gap F) is already covered by
+  task 18's "failed partial scans archive nothing"; and explicit non-silent query failures (review
+  gap G) are added to task 36's acceptance.
 
 Each numbered item below is intended to fit one focused 2–6 hour coding session. Dependencies refer
 to task numbers, not phase names.
@@ -90,9 +96,12 @@ to task numbers, not phase names.
    - **Implement:** In `models.py`, define `source_items`, `source_versions`,
      `normalized_documents`, typed `normalized_chunks`, `change_events`,
      `connector_sync_states`, and `connector_scan_items`, including tenant-safe foreign keys and
-     current-row constraints.
+     current-row constraints; add the crypto-shred columns now (`source_versions.enc_key_id` plus
+     `raw_content` typed as the per-record encrypted unit) so right-to-deletion needs no later
+     schema retrofit, per ARCHITECTURE's day-1 rule.
    - **Acceptance:** Metadata tests assert all required columns, unique keys, revision fields,
-     chunk offsets/hashes, scan generations, checkpoint health, and tenant predicates exist.
+     chunk offsets/hashes, scan generations, checkpoint health, the `enc_key_id`/encrypted
+     `raw_content` crypto-shred unit, and tenant predicates exist.
    - **Dependencies:** 6.
 
 8. **Model extraction, review, and embedding tables** *(4–6h)*
@@ -169,9 +178,12 @@ to task numbers, not phase names.
 17. **Implement scoped Notion scanning and fetching** *(4–6h)*
     - **Implement:** Complete `NotionConnector.full_scan`, `incremental_scan`, `fetch_children`, and
       `fetch`; scope traversal to configured roots, serialize canonical raw JSON, derive monotonic
-      revisions, and apply the configured fallback ACL with `permission_metadata=False`.
+      revisions, and apply the configured fallback ACL with `permission_metadata=False`. Add the
+      cheap pre-fetch gate: skip fetching a page's block tree entirely when its `last_edited_time`
+      (plus child-count/size hints) is unchanged versus the recorded sync state, before any hashing.
     - **Acceptance:** Recorded nested/paginated fixtures produce stable refs and snapshots;
-      unchanged fetches keep the same hash; out-of-scope pages are excluded.
+      unchanged fetches keep the same hash; pages with an unchanged `last_edited_time` are skipped
+      without a block-tree fetch; out-of-scope pages are excluded.
    - **Dependencies:** 15, 16.
 
 18. **Implement reconciliation and tombstone detection** *(4–6h)*
@@ -338,7 +350,9 @@ to task numbers, not phase names.
       connectors, providers, handlers, search/review/source/sync/detail services, and worker
       registry from typed settings; add graceful shutdown.
     - **Acceptance:** `uv run cognitio-worker` and `uv run uvicorn cognitio_api.main:app` start from
-      `.env.example`-documented settings and no route returns “service not configured.”
+      `.env.example`-documented settings and no route returns “service not configured”; malformed or
+      unsupported query/search requests return an explicit error rather than a silently empty result
+      that is indistinguishable from “no matches.”
     - **Dependencies:** 2, 20, 21, 22, 23, 24, 28, 29, 31, 32, 33.
 
 37. **Add operational APIs, audit, and runbooks** *(4–6h)*
