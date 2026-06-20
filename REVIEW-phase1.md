@@ -1,143 +1,171 @@
-# PR #2 Review — Phase 1: Storage + Connectors
+# PR #2 Review — Phase 1: Storage + Connectors (tasks 6–13)
 
-Verdict: **request changes**. The implemented subset is clean and passes its tests, but tasks 8,
-9, 11, 12, and 13 are materially incomplete, and the Notion pre-fetch acceptance criterion is not
-implemented end to end.
+**Verdict: request changes.** The landed subset is clean, typed, and green — migrations apply,
+75 unit + 15 integration tests pass against a real pgvector Postgres, and the core tenant-safe
+schema is well modelled. But the PR is materially **under-scoped against the task-6–13 acceptance
+criteria**: five required tables and their repositories are absent (task 8/9/13), several task-11/12
+repository operations are missing, the Notion pre-fetch gate is not wired into the fetch path
+(task 13/17), and the edge fan-out guard diverges from DESIGN. Each finding below was verified
+against the code and, where checkable, against a live database on this branch.
 
-## Blockers
+Live verification (this branch, against `pgvector/pgvector:pg16`):
 
-1. **Required Phase 1 tables are missing from both the models and initial migration.**
-   - Task 8 requires `cost_events` plus searchable text/`tsvector` support on normalized documents
-     and extractions. None are present.
-   - Task 9 requires `jobs`, `entity_merges`, `access_audit_events`, and
-     `blocking_signatures`. None are present.
-   - A clean migrated database contains only 17 application tables:
-     `change_events`, `conflicts`, `connector_scan_items`, `connector_sync_states`, `edges`,
-     `embeddings`, `entities`, `entity_mentions`, `extractions`, `normalized_chunks`,
-     `normalized_documents`, `principals`, `review_items`, `source_acl_rules`, `source_items`,
-     `source_versions`, and `tenants`.
-   - The metadata test's `ALL_TABLES` set omits the same required tables, so it cannot catch the
-     gap (`packages/storage/tests/test_models_metadata.py:20`).
+| Check | Command | Result |
+|---|---|---|
+| Frozen install | `uv sync --frozen` | ✅ |
+| Lint | `ruff check .` / `ruff format --check .` | ✅ (75 files) |
+| Types (CI target) | `uv run mypy` | ✅ 62 source files |
+| Unit | `pytest -m "not integration and not live"` | ✅ 75 passed |
+| Integration | `pytest -m integration` | ✅ 15 passed (real migrated DB) |
+| Migration | `alembic upgrade head` → `downgrade -1` → re-upgrade | ✅, creates **17** app tables |
 
-2. **Repository tasks 11–13 are incomplete.**
-   - There are no repositories for jobs, costs, conflicts, entity merges, blocking signatures,
-     source ACL rules, access audits, or entity mentions.
-   - Task 11's `archive_missing` operation is absent. `ConnectorScanRepository.missing_since`
-     only returns IDs and does not enforce the “completed scan only” safety condition
-     (`packages/storage/src/cognitio_storage/repositories/sync.py:132`).
-   - Task 12 requires document/chunk diff operations and extraction insert/version/stale/archive/
-     searchable-text operations. Only document insert/get, chunk hash listing, extraction insert,
-     stale, and trust updates exist. Extraction versioning, archive, searchable-text updates, and a
-     typed chunk diff are absent.
-   - Task 13's queue, conflict, blocking-signature, cost, and immutable access-audit repositories
-     are absent.
-   - Repositories are not exposed through `Uow`; `Uow.__aenter__` returns a bare `AsyncSession`
-     (`packages/storage/src/cognitio_storage/db.py:48`).
+---
 
-3. **The Notion pre-fetch gate is not connected to the fetch path.**
-   - `NotionConnector.needs_fetch` exists only as a static helper
-     (`packages/connectors/src/cognitio_connectors/notion/connector.py:105`).
-   - `fetch()` always calls `retrieve_page` and `_collect_blocks`
-     (`packages/connectors/src/cognitio_connectors/notion/connector.py:120`); it receives no
-     recorded timestamp/checkpoint and never calls `needs_fetch`.
-   - The test checks the helper's Boolean result but never proves that an unchanged page avoids a
-     block-tree request (`packages/connectors/tests/test_notion_connector.py:153`).
-   - Therefore the explicit acceptance criterion “unchanged `last_edited_time` skips the
-     block-tree fetch” is not met.
+## Blockers (task acceptance not met)
 
-4. **Persisted `supports`/`contradicts` enforcement does not match DESIGN.md.**
-   - Minimum confidence floors (`supports >= 0.7`, `contradicts >= 0.8`) are not enforced.
-     `confidence=None` is accepted by `EdgeRepository.insert`
-     (`packages/storage/src/cognitio_storage/repositories/edges.py:55`).
-   - When a cap is reached, the implementation raises instead of retaining/replacing the strongest
-     edges.
-   - The repository's count-then-insert is race-prone, and the trigger also performs an unlocked
-     `count(*)`; concurrent writers can all observe space below the cap and commit above it
-     (`packages/storage/src/cognitio_storage/migrations/versions/0001_initial.py:37`).
-   - The integration test covers only sequential `contradicts` inserts through the repository. It
-     does not test `supports`, confidence floors, strongest-edge retention, the database trigger,
-     or concurrent writers.
+### 1. Five required tables are missing from the models and migration (tasks 8, 9)
+A freshly migrated database contains 17 application tables. Absent:
 
-5. **The initial migration is not a frozen schema revision.**
-   - `0001_initial.py` imports live ORM metadata and runs `Base.metadata.create_all()` /
-     `drop_all()` (`packages/storage/src/cognitio_storage/migrations/versions/0001_initial.py:68`,
-     `:89`).
-   - Any later model edit silently changes what revision `0001_initial` creates and drops. That
-     defeats Alembic's forward-only migration history and can make identical revision IDs produce
-     different schemas across environments.
-   - Replace this with explicit Alembic operations for the complete initial schema, enums,
-     constraints, and indexes.
+- **Task 8** — `cost_events`, and the **searchable text / `tsvector`** surface on extractions and
+  normalized documents. `grep` finds no `tsvector`, `to_tsvector`, `pg_trgm`, or any `searchable_*`
+  column anywhere in `packages/storage`. The only GIN index is `ix_extr_payload` over the raw JSONB
+  payload — not the FTS surface task 8 requires.
+- **Task 9** — `jobs`, `entity_merges`, `access_audit_events`, `blocking_signatures`.
+
+The metadata test's `ALL_TABLES` set (`packages/storage/tests/test_models_metadata.py:20`) omits
+exactly these tables, so `test_all_tables_present` cannot catch the gap. The test docstring claims
+it covers "tasks 7-9".
+
+### 2. Repository tasks 11–13 are incomplete
+- **Task 13 has essentially no implementation.** There are no repositories for jobs, costs,
+  conflicts, entity merges, blocking signatures, source ACL rules, access audits, or entity
+  mentions. Task 13's named acceptance — "job dedupe, … immutable audit insertion, … open-conflict
+  lookup" — is untestable because neither the tables nor the repos exist.
+- **Task 11** — there is no `archive_missing` operation. `ConnectorScanRepository.missing_since`
+  (`repositories/sync.py:132`) returns tombstone *candidates* but never archives, and does not
+  enforce the "only after a completed scan" safety condition. Task 11's "incomplete scans never
+  archive data" cannot be asserted because no archive path is wired.
+- **Task 12** — only `insert_if_absent` / `get` / `current_by_fingerprint` / `by_chunk` /
+  `mark_stale` / `set_trust` exist on `ExtractionRepository`. The required extraction
+  **versioning / supersession**, **archive**, and **searchable-text** operations, plus a typed
+  **chunk diff**, are absent (`hashes_for_document` returns a raw `{id: hash}` map, not a diff).
+- Repositories are **not exposed through `Uow`** as task 12 asks. `Uow.__aenter__` yields a bare
+  `AsyncSession` (`db.py:48`); callers must construct each repository by hand.
+
+### 3. Notion pre-fetch gate is not connected to the fetch path (task 13 / 17)
+- `NotionConnector.needs_fetch(...)` exists only as a **static helper**
+  (`notion/connector.py:104`). `fetch()` (`:120`) unconditionally calls `retrieve_page` and
+  `_collect_blocks`; it receives no recorded timestamp/checkpoint and never calls `needs_fetch`.
+- `test_prefetch_gate_skips_unchanged` (`tests/test_notion_connector.py:156`) asserts only the
+  boolean helper's return value. **No test proves a block-tree request is skipped.** The file
+  docstring nonetheless claims it "covers … the last_edited_time pre-fetch gate."
+- Net: the acceptance criterion "pages with an unchanged `last_edited_time` are skipped without a
+  block-tree fetch" is not demonstrated. (Reasonable design seam — the gate belongs in the
+  reconcile/fetch handler — but as shipped it is a dead helper, so it should not be claimed done.)
+
+---
 
 ## Should fix
 
-1. **Notion capabilities and incremental behavior are overstated.**
-   - `updated_since_filter=True` is declared, but the HTTP search request supplies only a sort and
-     object filter; it never sends an updated-since predicate
-     (`packages/connectors/src/cognitio_connectors/notion/client.py:82`).
-   - `_in_scope` recognizes configured roots and immediate children only, not an arbitrary page
-     subtree (`packages/connectors/src/cognitio_connectors/notion/connector.py:184`).
-   - `source_revision` is epoch seconds only. ARCHITECTURE.md explicitly requires
-     `last_edited_time + fetch sequence` because Notion timestamps are second-rounded; two edits in
-     one second can collapse to the same revision.
+### 4. Edge fan-out guard diverges from DESIGN and is not concurrency-safe
+DESIGN §"Write-time discipline for materialized supports/contradicts" requires: materialize
+`supports` only at confidence ≥ 0.7 and `contradicts` only at ≥ 0.8, and **when the cap is hit,
+drop the lowest-confidence edge so only the strongest survive**.
 
-2. **Quiet/empty Notion scans do not necessarily advance a high-watermark.**
-   - `_max_last_edited([])` returns `None`; the sync repository ignores a `None` high-watermark
-     (`packages/storage/src/cognitio_storage/repositories/sync.py:53`).
-   - The checkpoint unit/integration tests pass a synthetic non-null high-watermark, so they do not
-     cover the actual empty Notion page behavior.
+- `EdgeRepository.insert` (`repositories/edges.py:55`) accepts `confidence=None` and enforces **no
+  floor**.
+- At the cap it **raises `EdgeCapExceeded`** rather than replacing the weakest edge.
+- The guard is **count-then-insert** in the repo, and the DB trigger
+  (`migrations/versions/0001_initial.py:37`) also does an **unlocked `count(*)`**; concurrent
+  writers can each see room below the cap and commit above it.
+- `test_edge_fanout_cap_guard` covers only sequential `contradicts` inserts through the repo — no
+  `supports`, no floor, no weakest-drop, no trigger path, no concurrency.
 
-3. **Some relational integrity and consistency constraints are weaker than the design.**
-   - `source_items.current_version_id` is an unconstrained UUID despite DESIGN/ARCHITECTURE
-     describing it as a source-version FK (`packages/storage/src/cognitio_storage/models.py:191`).
-   - Tenant-scoped rows contain `tenant_id` but do not FK it to `tenants`; tests intentionally
-     insert arbitrary tenant UUIDs.
-   - Gold consistency is enforced in one direction only: Gold requires `gold_source`, but a
-     non-Gold extraction may still carry `gold_source`.
-   - Chunk spans allow zero-length chunks (`end_char >= start_char`) and do not constrain offsets
-     against the document length.
+The strict floor + weakest-drop behaviour is formally task 34 (Phase 3), so its absence is
+acceptable *for this PR* — but the cap should be tracked as a deferral, and the **race** is a
+genuine Phase-1 correctness defect in code that ships now.
 
-4. **Idempotent writes use read-then-insert and are not concurrency-safe.**
-   - `upsert_ref`, source-version insertion, change-event insertion, sync-state creation, scan
-     membership, and extraction insertion can race and surface unique violations instead of
-     becoming no-ops. Use PostgreSQL `ON CONFLICT` or explicitly handle `IntegrityError` within a
-     savepoint.
+### 5. Initial migration is not a frozen revision
+`0001_initial` calls `Base.metadata.create_all()` / `drop_all()` (`:68`, `:89`). Revision 0001 is
+therefore not pinned to a schema snapshot: any later model edit silently changes what 0001 creates,
+which defeats forward-only migration history. Task 10 asks for tables/indexes created **"explicitly"**
+(only the HNSW index and fan-out trigger currently are). Functionally task 10's acceptance passes
+(upgrade/downgrade/re-upgrade verified), so this is maintainability rather than correctness — but
+worth fixing before more revisions stack on top.
 
-5. **Source-item upsert is insert-only.**
-   - An existing item does not refresh `source_url`, `node_type`, ACL, or lifecycle. Connector
-     metadata and reactivated items can remain stale.
+### 6. Notion connector overstates capabilities / incremental behaviour
+- `capabilities()` declares `updated_since_filter=True`, but `search()` (`notion/client.py:83`)
+  sends only an object filter + `last_edited_time` sort — no updated-since predicate. The
+  capability is dishonest (Notion's search has no such filter; the connector relies on descending
+  sort).
+- `source_revision` is epoch seconds only (`connector.py:225`). ARCHITECTURE.md:450 explicitly
+  requires `last_edited_time + a fetch sequence` because Notion timestamps are second-rounded; two
+  edits in one second collapse to the same revision and the monotonic guard then drops the second.
+- `_in_scope` (`connector.py:184`) matches configured roots and their **immediate** children only,
+  not an arbitrary page subtree as DESIGN describes.
 
-6. **Tests cover a real database but not the full acceptance surface.**
-   - The integration fixture runs real Alembic migrations and binds repositories to PostgreSQL;
-     these are not mocks.
-   - Missing coverage includes all omitted tables/repositories, cross-tenant writes/FK rejection,
-     incomplete-scan archive safety, duplicate-write races, extraction version/archive behavior,
-     job dedupe, immutable audit insertion, open-conflict lookup, edge-trigger enforcement, and
-     concurrent edge caps.
-   - Notion unit tests use `httpx.MockTransport`, which is appropriate, but do not test an actual
-     pre-fetch skip, search pagination, deep subtree scoping, empty-page checkpointing, timeout,
-     5xx retry, or same-second revisions.
+### 7. Idempotent writers are read-then-insert (not concurrency-safe)
+`upsert_ref`, `SourceVersion.insert_if_new`, `ChangeEvent.insert_if_new`, scan membership, and
+extraction insert all do `SELECT … else INSERT`. Under concurrency these race and surface a unique
+violation instead of becoming a no-op. Use `INSERT … ON CONFLICT DO NOTHING/UPDATE` (the embedding
+repo already does — good). Relatedly, `upsert_ref` is **insert-only**: an existing item never
+refreshes `source_url` / `node_type` / `acl` / `lifecycle`, so reactivated or moved items go stale.
+
+### 8. Minor schema / consistency gaps
+- `source_items.current_version_id` is an unconstrained nullable UUID; ARCHITECTURE.md:78 describes
+  it as an FK → `source_versions`. Defensible (avoids a circular FK) but integrity is app-only.
+- Tenant-scoped rows carry `tenant_id` but **no FK to `tenants`**; tests insert arbitrary tenant
+  UUIDs and they persist. Composite tenant-safe FKs between data tables are correct, but the tenant
+  root itself is unenforced.
+- Gold consistency is one-directional: `gold_needs_source` ensures gold ⇒ `gold_source`, but a
+  non-gold row may still carry a stray `gold_source`.
+- `chunk_span_ordered` allows zero-length chunks (`end_char >= start_char`) and does not bound
+  offsets against document length.
+- An empty Notion scan yields `_max_last_edited([]) == None`, and `checkpoint` ignores a `None`
+  high-watermark (`sync.py:53`); the "advances on empty" test feeds a synthetic non-null watermark,
+  so the real empty-page path is not exercised. Cursor still advances, so this is mild.
+
+---
+
+## Test gaps (tests are real, but acceptance surface is thin)
+- ✅ Integration tests run against a **real migrated Postgres** with per-test rollback — not mocks.
+  Notion tests use `httpx.MockTransport`, which is the right call.
+- Missing: cross-tenant **write/FK rejection** (only read isolation is tested); `supports` edges +
+  floors + weakest-drop + DB trigger + concurrent cap; extraction stale/trust read-back and any
+  version/archive path; job dedupe and immutable audit (no tables); an actual pre-fetch **skip**;
+  search pagination, deep-subtree scoping, empty-page checkpoint, timeout/5xx, and same-second
+  revisions. `Uow` commit/rollback (task 6) is covered by `test_db_uow.py` — good.
+
+---
 
 ## Verified good
+- **Connector contract is exact.** `Connector` (Protocol) and `AbstractConnector` carry every
+  signature from DESIGN.md:231 / ARCHITECTURE.md:405 — `capabilities`, `full_scan`,
+  `incremental_scan`, `fetch`, `fetch_children`, `tombstone_scan` — with matching types.
+- **Tenant scoping is structural.** Every table has a non-null `tenant_id`; parent→child links use
+  composite tenant-safe FKs `(tenant_id, x) → (parent.tenant_id, parent.id)`; `edges` correctly
+  carry no FKs (polymorphic).
+- **Crypto-shred columns present day 1.** `source_versions.raw_content` (bytea) + `enc_key_id`
+  (uuid), immutable snapshot identity, and the `one_current_version` partial unique index all
+  exist. (Encryption itself is not yet applied — `raw_content` is stored as plaintext bytes; fine
+  for a schema-readiness task, but flag for the fetch handler.)
+- **Constraints/indexes modelled correctly:** evidence-non-empty + gold-needs-source CHECKs,
+  current-only fingerprint uniqueness, promoted query columns, one-embedding-per-object-version,
+  per-version HNSW ANN index, edge lookup indexes, and the fan-out trigger.
+- **Async Alembic is correct** — `env.py` drives migrations through an `AsyncEngine` +
+  `connection.run_sync`, reading `DATABASE_URL`/`TEST_DATABASE_URL`.
+- **CI migration step works** — now `uv run alembic -c packages/storage/alembic.ini upgrade head`;
+  verified upgrade/downgrade/re-upgrade on a disposable pg16 DB. The integration fixture runs the
+  real migration before binding repositories.
 
-- `Connector` and `AbstractConnector` contain all method signatures specified by DESIGN.md:
-  capabilities, full/incremental scan, fetch, child fetch, and tombstone scan.
-- Every implemented application table has a non-null `tenant_id`; implemented parent-child
-  relationships use composite tenant-safe FKs. Polymorphic `edges` correctly have no FKs.
-- `source_versions` includes `raw_content: bytea` and `enc_key_id: uuid`, plus immutable snapshot
-  identity and a partial current-version index. Actual encryption still needs to occur before
-  repository insertion.
-- Extraction evidence non-empty, current-fingerprint uniqueness, promoted query columns,
-  Gold-requires-source, model-version embedding uniqueness, edge lookup indexes, and current-row
-  partial indexes are represented in metadata.
-- Async Alembic execution is wired correctly through `AsyncEngine` and `run_sync`.
-- On a disposable pgvector/PostgreSQL 16 database, `alembic upgrade head`, `downgrade -1`, and
-  re-upgrade all completed successfully.
-- CI's root-level migration command works with the current `alembic.ini`, and the integration
-  fixture exercises the real migration before repository tests.
-- Local verification on this branch:
-  - `uv sync --frozen` — passed
-  - `ruff check .` and `ruff format --check .` — passed
-  - `mypy` — passed
-  - unit tests — 75 passed
-  - PostgreSQL integration tests — 15 passed
-
+## Task-by-task acceptance summary
+| Task | Scope | Status |
+|---|---|---|
+| 6 | base types, `db.py`, `Uow` | ✅ (repos not exposed via `Uow`) |
+| 7 | source/sync/normalization tables + crypto-shred | ✅ |
+| 8 | extraction/review/embedding tables | ⚠️ `cost_events` + tsvector/FTS missing |
+| 9 | queue/entity/conflict/edge/audit tables | ❌ `jobs`, `entity_merges`, `access_audit_events`, `blocking_signatures` missing |
+| 10 | initial Alembic migration | ✅ functional; ⚠️ uses `create_all`, not frozen |
+| 11 | source/sync repositories | ⚠️ no `archive_missing`; read-then-insert races |
+| 12 | doc/chunk/extraction repositories | ⚠️ no extraction version/archive/searchable-text, no chunk diff, not on `Uow` |
+| 13 | queue/review/embedding/edge/audit repositories | ❌ only embedding/review/edge present; queue/cost/conflict/audit absent |
