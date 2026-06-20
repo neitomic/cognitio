@@ -1,6 +1,7 @@
 """Cognitio connector contracts and source implementations."""
 
 from cognitio_connectors.base import (
+    AbstractConnector,
     AccessDescriptor,
     ChangeEvent,
     Connector,
@@ -9,10 +10,12 @@ from cognitio_connectors.base import (
     Page,
     SourceRef,
     SourceSnapshot,
+    SyncCheckpoint,
     Tombstone,
 )
 
 __all__ = [
+    "AbstractConnector",
     "AccessDescriptor",
     "ChangeEvent",
     "Connector",
@@ -21,5 +24,6 @@ __all__ = [
     "Page",
     "SourceRef",
     "SourceSnapshot",
+    "SyncCheckpoint",
     "Tombstone",
 ]

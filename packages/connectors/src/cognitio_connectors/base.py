@@ -2,9 +2,10 @@
 
 from __future__ import annotations
 
+from abc import ABC, abstractmethod
 from dataclasses import dataclass, field
 from datetime import datetime
-from typing import Protocol
+from typing import Protocol, runtime_checkable
 
 from cognitio_storage.enums import ChangeType
 
@@ -87,7 +88,23 @@ class ConnectorHealth:
     error: str | None = None
 
 
+@dataclass(frozen=True)
+class SyncCheckpoint:
+    """A resumable sync position: the opaque cursor plus a high-watermark.
+
+    ``high_watermark`` advances even across empty scans so a long quiet period still records
+    progress; ``scan_generation`` identifies the full-scan pass for tombstone detection.
+    """
+
+    cursor: str | None
+    high_watermark: str | None
+    scan_generation: int = 0
+
+
+@runtime_checkable
 class Connector(Protocol):
+    """Structural contract every connector satisfies (used in type hints across layers)."""
+
     name: str
 
     def capabilities(self) -> ConnectorCapabilities: ...
@@ -100,4 +117,32 @@ class Connector(Protocol):
 
     async def fetch_children(self, ref: SourceRef, cursor: str | None) -> Page[SourceRef]: ...
 
+    async def tombstone_scan(self, cursor: str | None) -> Page[Tombstone]: ...
+
+
+class AbstractConnector(ABC):
+    """Convenience base for concrete connectors: declares the contract as abstract methods.
+
+    Subclasses inherit nothing but the obligation to implement every method; the structural
+    :class:`Connector` protocol is what callers type against. ``name`` is a class attribute.
+    """
+
+    name: str
+
+    @abstractmethod
+    def capabilities(self) -> ConnectorCapabilities: ...
+
+    @abstractmethod
+    async def full_scan(self, cursor: str | None) -> Page[SourceRef]: ...
+
+    @abstractmethod
+    async def incremental_scan(self, cursor: str | None) -> Page[ChangeEvent]: ...
+
+    @abstractmethod
+    async def fetch(self, ref: SourceRef) -> SourceSnapshot: ...
+
+    @abstractmethod
+    async def fetch_children(self, ref: SourceRef, cursor: str | None) -> Page[SourceRef]: ...
+
+    @abstractmethod
     async def tombstone_scan(self, cursor: str | None) -> Page[Tombstone]: ...
